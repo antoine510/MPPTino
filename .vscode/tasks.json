@@ -1,0 +1,17 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Flash w/ USBASP",
+            "type": "process",
+            "command": "${env:PROGRAMFILES(X86)}/Arduino/hardware/tools/avr/bin/avrdude.exe",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "args": ["-C${env:PROGRAMFILES(X86)}/Arduino/hardware/tools/avr/etc/avrdude.conf", "-v", "-cusbasp", "-pm328p", "-B5", "-Uflash:w:build/MPPTino.ino.hex"],
+            "problemMatcher": []
+        }
+    ]
+}
