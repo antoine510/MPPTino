@@ -12,6 +12,12 @@
             },
             "args": ["-C${env:PROGRAMFILES(X86)}/Arduino/hardware/tools/avr/etc/avrdude.conf", "-v", "-cusbasp", "-pm328p", "-B5", "-Uflash:w:build/MPPTino.ino.hex"],
             "problemMatcher": []
+        },
+        {
+            "label": "Disassemble",
+            "type": "shell",
+            "command": "./disassemble.sh",
+            "problemMatcher": []
         }
     ]
 }

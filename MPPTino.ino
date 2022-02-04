@@ -1,111 +1,142 @@
+#ifndef __AVR_ATmega328P__
+#define __AVR_ATmega328P__
+#endif
+
 #include <Wire.h>
 #include <PAC1710.h>
 #include <ST7565.h>
+#include <LowPower.h>
 
 const uint8_t MCP4561address = 0x2e;
-int MCPWiper = 0;
+uint8_t MCPWiper = 0;
 //const uint8_t trackingSpeed = 4u;  // Maximum change of wiper: 4 steps/s, one step is approx. 0.1A
 PAC1710 pac;
+typedef PAC1710::ValueReader<2, PAC1710::SS_20MV> PACReader;
+constexpr uint8_t SERIAL_QUERY_PIN = 3;
+uint8_t sleep = true;
+
+struct SerialData {
+	uint16_t millivolts;
+	uint16_t milliamps;
+	uint16_t deciwatts;
+	uint16_t joules;
+};
+SerialData sdata;
+uint8_t sendNow = false;
 
 void setWiper(uint8_t value) {
-  Wire.beginTransmission(MCP4561address);
-  Wire.write(0x00); // Write command to address 0 (wiper volatile)
-  Wire.write(value);
-  Wire.endTransmission();
-  MCPWiper = value;
+	Wire.beginTransmission(MCP4561address);
+	Wire.write(0x00); // Write command to address 0 (wiper volatile)
+	Wire.write(value);
+	Wire.endTransmission();
+	MCPWiper = value;
 }
 
 void moveWiper(bool decrement) {
-  Wire.beginTransmission(MCP4561address);
-  Wire.write(0x04 << decrement); // Inc/Dec address 0 (wiper volatile)
-  Wire.endTransmission();
-  MCPWiper += 1 - 2 * decrement;
-  if(MCPWiper < 0) MCPWiper = 0;
-  else if(MCPWiper > 255) MCPWiper = 255;
+	Wire.beginTransmission(MCP4561address);
+	Wire.write(0x04 << decrement); // Inc/Dec address 0 (wiper volatile)
+	Wire.endTransmission();
+	MCPWiper += 1 - 2 * decrement;
 }
 
-/*int trackMPP(float voltage, float current) {
-  static float oldV = voltage, oldI = current;
-  if(voltage < 20.f) return -trackingSpeed; // Reduce current as much as possible
-  if(current < .4f) return trackingSpeed; // Increase current as much as possible
-  float dV = voltage - oldV;
-  float mdIdV = (oldI - current) / dV;  // -dI/dV, always positive, expected to be < 2.5
-  int command = floorf((mdIdV - current / voltage) * trackingSpeed);
-  if(command > trackingSpeed) command = trackingSpeed;
-  if(command != 0) {
-    oldV = voltage;
-    oldI = current;
-  }
-  return command;
-}*/
-
-
+void serial_query_ISR() {
+	if(sleep) return;
+	sendNow = true;
+}
 
 void setup() {
-  Wire.begin();
-  setWiper(MCPWiper);
-  //pac.SetSamplingTimesMs(20, 80);
-  //pac.SetAveraging(PAC1710::AVG_NONE, PAC1710::AVG_8);
-  pac.Init(PAC1710::SS_20MV, 2.0f);
-  
-  ST7565::begin(0x03);
-  ST7565::display();
-  delay(1000);
-  ST7565::clear();
+	ADCSRA &= ~(1 << ADEN); // Disable ADC
 
-  ST7565::drawchar(0, 0, 'V');
-  ST7565::drawchar(6, 0, ':');
-  ST7565::drawchar(0, 1, 'A');
-  ST7565::drawchar(6, 1, ':');
-  ST7565::drawchar(0, 2, 'P');
-  ST7565::drawchar(6, 2, ':');
-  ST7565::drawchar(0, 3, 'W');
-  ST7565::drawchar(6, 3, ':');
+	Serial.begin(9600);
+	Wire.begin();
+	setWiper(MCPWiper);
+	pac.SetSamplingTimesMs(20, 80);
+	pac.SetAveraging(PAC1710::AVG_NONE, PAC1710::AVG_8);
+	pac.SetSenseScale(PAC1710::SS_20MV);
+
+	ST7565::begin(0x03);
+	ST7565::clear();
+
+	ST7565::drawchar_aligned(2, 0, '.');
+	ST7565::drawchar_aligned(4, 0, 'V');
+
+	ST7565::drawchar_aligned(2, 1, '.');
+	ST7565::drawchar_aligned(5, 1, 'A');
+
+	ST7565::drawchar_aligned(3, 2, 'W');
+
+	ST7565::drawchar_aligned(3, 3, 'U');
+
+	attachInterrupt(digitalPinToInterrupt(SERIAL_QUERY_PIN), &serial_query_ISR, RISING);
 }
 
-const float crashVoltage = 25.f, minVoltage = 30.9f, maxVoltage = 32.f;
-constexpr unsigned long loopTimeUs = 100000;
+constexpr unsigned crashVoltage = 25000, minVoltage = 30900, maxVoltage = 32000;
+constexpr unsigned long loopTime = 500ul;
+unsigned loopActualTime;
+byte crashCount = 0;
+constexpr byte sleepCrashCount = 5; // If we have been under the crash voltage for more than sleepCrashCount * loopTime, sleep
 
 void loop() {
-  unsigned long startTime = micros();
+	static unsigned long lastLoop = millis();
+	loopActualTime = millis() - lastLoop;
+	lastLoop = millis();
 
-  //pac.ReadOnce(PAC1710::READ_VOLTAGE);
-  float volts = pac.GetVoltage(), amps = pac.GetCurrent(), power = pac.GetPower();
-  if(volts < crashVoltage) setWiper(0);  // Voltage crashed, reset
-  else if(volts < minVoltage) moveWiper(true);
-  else if(volts > maxVoltage) moveWiper(false);
+	pac.ReadOnce(PAC1710::READ_ALL);
+	sdata.millivolts = PACReader::GetVoltageI(pac);
+	sdata.milliamps = abs(PACReader::GetCurrentI(pac));
+	sdata.deciwatts = PACReader::GetPowerI(pac);
 
-  int volti = volts * 10.f, ampi = amps * 100.f, powi = power;
-  ampi = abs(ampi);
+	sdata.joules += (uint32_t)sdata.deciwatts * loopActualTime / 10000;
 
-  ST7565::drawchar(12, 0, volti / 100 + 48);
-  ST7565::drawchar(18, 0, (volti / 10) % 10 + 48);
-  ST7565::drawchar(24, 0, '.');
-  ST7565::drawchar(30, 0, volti % 10 + 48);
+	if(sdata.millivolts < crashVoltage) {
+		if(crashCount > sleepCrashCount) {
+			if(!sleep) {
+				pac.SetStandby(true);	// Sleep if running
+				sleep = true;
+			}
+		} else {
+			if(!crashCount) {
+				setWiper(0);
+			} else {
+				++crashCount;
+			}
+		}
+	} else {
+		if(sdata.millivolts < minVoltage) moveWiper(true);
+		else if(sdata.millivolts > maxVoltage) moveWiper(false);
 
-  ST7565::drawchar(12, 1, amps >= 0 ? '+' : '-');
-  ST7565::drawchar(18, 1, ampi / 100 + 48);
-  ST7565::drawchar(24, 1, '.');
-  ST7565::drawchar(30, 1, (ampi / 10) % 10 + 48);
-  ST7565::drawchar(36, 1, ampi % 10 + 48);
+		crashCount = 0;
+		if(sleep) {
+			pac.SetStandby(false);	// Wakeup if sleeping
+			sleep = false;
+		}
+	}
 
-  ST7565::drawchar(12, 2, powi / 100 + 48);
-  ST7565::drawchar(18, 2, (powi / 10) % 10 + 48);
-  ST7565::drawchar(24, 2, powi % 10 + 48);
+	if(sendNow) {
+		Serial.write((unsigned char*)(&sdata), sizeof(sdata));
+		sdata.joules = 0;
+		sendNow = false;
+	}
 
-  ST7565::drawchar(12, 3, MCPWiper / 100 + 48);
-  ST7565::drawchar(18, 3, (MCPWiper / 10) % 10 + 48);
-  ST7565::drawchar(24, 3, MCPWiper % 10 + 48);
+	ST7565::drawchar_aligned(0, 0, sdata.millivolts / 10000 + 48);
+	ST7565::drawchar_aligned(1, 0, (sdata.millivolts / 1000) % 10 + 48);
+	ST7565::drawchar_aligned(3, 0, (sdata.millivolts / 100) % 10 + 48);
 
-  ST7565::display();
+	ST7565::drawchar_aligned(0, 1, sdata.milliamps / 10000 + 48);
+	ST7565::drawchar_aligned(1, 1, (sdata.milliamps / 1000) % 10 + 48);
+	ST7565::drawchar_aligned(3, 1, (sdata.milliamps / 100) % 10 + 48);
+	ST7565::drawchar_aligned(4, 1, (sdata.milliamps / 10) % 10 + 48);
 
-  delayMicroseconds(loopTimeUs + startTime - micros()); // Beware of overflow!
-  /*Serial.print("Power: ");
-  Serial.print(power);
-  Serial.print("W, current: ");
-  Serial.print(current);
-  Serial.print("A, voltage: ");
-  Serial.print(voltage);
-  Serial.print("V, wiper: ");
-  Serial.println(MCPWiper);*/
+	ST7565::drawchar_aligned(0, 2, (sdata.deciwatts / 1000) % 10 + 48);
+	ST7565::drawchar_aligned(1, 2, (sdata.deciwatts / 100) % 10 + 48);
+	ST7565::drawchar_aligned(2, 2, (sdata.deciwatts / 10) % 10 + 48);
+
+	ST7565::drawchar_aligned(0, 3, MCPWiper / 100 + 48);
+	ST7565::drawchar_aligned(1, 3, (MCPWiper / 10) % 10 + 48);
+	ST7565::drawchar_aligned(2, 3, MCPWiper % 10 + 48);
+
+	ST7565::display();
+
+	if(sleep) LowPower.powerDown(SLEEP_8S, ADC_ON, BOD_ON);
+	else delay(loopTime);
 }
