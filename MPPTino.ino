@@ -69,20 +69,21 @@ void setup() {
 	attachInterrupt(digitalPinToInterrupt(SERIAL_QUERY_PIN), &serial_query_ISR, RISING);
 }
 
-constexpr unsigned crashVoltage = 25000, minVoltage = 30000, maxVoltage = 32000;
+constexpr unsigned minVoltage = 30000, maxVoltage = 35000;
 
 /**
  * @brief Modulates reactivity to over or under voltage with power
  * 2^n only, higher is less reactive at high power
  * Ex: V > maxV => MCP += 1 + MCP / power_reactivity_scaling
  */
-constexpr uint8_t power_reactivity_scaling = 64;
+constexpr uint8_t power_reactivity_scaling = 32;
 
 // True for descreasing power, false for increasing power
 bool exploration_direction = false;
-uint16_t last_explored_power = 0;
 
-constexpr unsigned long loopTime = 200ul;
+uint16_t last_power = 0;
+
+constexpr unsigned long loopTime = 500ul;
 unsigned loopActualTime;
 byte crashCount = 0;
 constexpr byte sleepCrashCount = 5; // If we have been under the crash voltage for more than sleepCrashCount * loopTime, sleep
@@ -110,38 +111,36 @@ void loop() {
 
 	sdata.joules += (uint32_t)sdata.deciwatts * loopActualTime / 10000;
 
-	if(sdata.millivolts < crashVoltage) {
+	if(sdata.millivolts < minVoltage) {	// Under-production
+		decreasePower();
+		exploration_direction = true;
+	} else if(sdata.millivolts > maxVoltage) {	// Over-production/Ouput limited
+		increasePower();
+		exploration_direction = false;
+	} else {
+		// Random walk within [minV, maxV]
+		if(last_power > sdata.deciwatts) {
+			exploration_direction = !exploration_direction;
+		}
+		moveWiper(exploration_direction);
+	}
+	last_power = sdata.deciwatts;
+
+	if(!MCPWiper) {	// Handle going to sleep
 		if(crashCount > sleepCrashCount) {
 			if(!sleep) {
 				pac.SetStandby(true);	// Sleep if running
 				sleep = true;
 			}
 		} else {
-			if(!crashCount) {
-				setWiper(0);
-			} else {
-				++crashCount;
-			}
+			++crashCount;
 		}
 	} else {
-		if(sdata.millivolts < minVoltage) {	// Under-production
-			decreasePower();
-			exploration_direction = true;
-		} else if(sdata.millivolts > maxVoltage) {	// Over-production/Ouput limited
-			increasePower();
-			exploration_direction = false;
-		} else {
-			// Random walk within [minV, maxV]
-			if(sdata.deciwatts < last_explored_power) exploration_direction = !exploration_direction;
-			moveWiper(exploration_direction);
-		}
-		last_explored_power = sdata.deciwatts;
-
-		crashCount = 0;
 		if(sleep) {
 			pac.SetStandby(false);	// Wakeup if sleeping
 			sleep = false;
 		}
+		crashCount = 0;
 	}
 
 	if(sendNow) {
