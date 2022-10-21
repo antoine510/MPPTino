@@ -8,13 +8,23 @@
 #include <LowPower.h>
 
 static constexpr const int serial_identity = 0x01;
+static constexpr const byte cmd_magic[] = {0x4f, 0xc7, 0xb2, 0x9a};
+enum SerialState : uint8_t {
+	MAGIC1, MAGIC2, MAGIC3, MAGIC4, IDENTITY, COMMAND
+} serial_state;
+enum CommandID : uint8_t {
+	READ_ALL = 0x01,
+	SET_MAX_WIPER = 0x02,		// Max wiper is next byte
+	SET_OUTPUT_ENABLED = 0x04	// 0b0000010e, e is output enable bit
+};
 
 const uint8_t MCP4561address = 0x2e;
+uint8_t max_wiper = 0xff;
 uint8_t MCPWiper = 0;
 
 PAC1710 pac;
 typedef PAC1710::ValueReader<2, PAC1710::SS_80MV> PACReader;
-bool sleep = true;
+bool sleep = false;
 
 struct SerialData {
 	uint16_t millivolts;
@@ -37,7 +47,7 @@ void moveWiper(bool decrement) {
 	Wire.beginTransmission(MCP4561address);
 	Wire.write(0x04 << decrement); // Inc/Dec address 0 (wiper volatile)
 	Wire.endTransmission();
-	if(!(decrement && MCPWiper == 0) && !(!decrement && MCPWiper == 0xff))
+	if(!(decrement && MCPWiper == 0) && !(!decrement && MCPWiper == max_wiper))
 		MCPWiper += 1 - 2 * decrement;
 }
 
@@ -46,8 +56,10 @@ void setup() {
 	ADCSRA &= ~(1 << ADEN); // Disable ADC
 
 	Serial.begin(9600);
+	Serial.setTimeout(200);
+	serial_state = MAGIC1;
 	Wire.begin();
-	setWiper(MCPWiper);
+	setWiper(0);
 	pac.SetSamplingTimesMs(20, 80);
 	pac.SetAveraging(PAC1710::AVG_NONE, PAC1710::AVG_8);
 	pac.SetSenseScale(PAC1710::SS_80MV);
@@ -68,6 +80,7 @@ void setup() {
 }
 
 constexpr unsigned minVoltage = 30000, maxVoltage = 35000;
+bool wiper_locked = false;
 
 /**
  * @brief Modulates reactivity to over or under voltage with power
@@ -80,8 +93,7 @@ constexpr uint8_t power_reactivity_scaling = 32;
 bool exploration_direction = false;
 uint8_t before_crash_wiper = 0;
 
-constexpr unsigned long loopTime = 1000ul;
-unsigned loopDuration = 0;
+constexpr unsigned long stateUpdatePeriod = 1000ul;
 byte crashCount = 0;
 constexpr byte sleepCrashCount = 5; // If we have been under the crash voltage for more than sleepCrashCount * loopTime, sleep
 
@@ -92,44 +104,66 @@ void decreasePower() {
 }
 void increasePower() {
 	uint8_t inc = 1 + MCPWiper / power_reactivity_scaling;	// Increase amperage proportionally to current power
-	if((MCPWiper ^ 0xff) <= inc) setWiper(0xff);
+	if((max_wiper - MCPWiper) <= inc) setWiper(max_wiper);
 	else setWiper(MCPWiper + inc);
 }
 
-void loop() {
-	unsigned long loopStartTime = millis();
+void runCommand(CommandID command) {
+	switch(command) {
+	case READ_ALL:
+		sdata->joules = global_joules;
+		Serial.write((byte*)(sdata), sizeof(SerialData));
+		global_joules = 0;
+		break;
+	case SET_MAX_WIPER:
+		Serial.readBytes(&max_wiper, 1);
+		break;
+	case SET_OUTPUT_ENABLED:
+	case SET_OUTPUT_ENABLED+1:
+		wiper_locked = !(command & 0b00000001);
+		if(wiper_locked) setWiper(0);
+		break;
+	}
+	serial_state = MAGIC1;	// Done with command, reset serial state
+}
 
+unsigned long lastStateUpdate = 0;
+void updateState() {
 	pac.ReadOnce(PAC1710::READ_ALL);
 	sdata->millivolts = PACReader::GetVoltageI(pac);
 	sdata->milliamps = abs(PACReader::GetCurrentI(pac));
 	sdata->deciwatts = PACReader::GetPowerI(pac);
 
-	global_joules += (uint32_t)sdata->deciwatts * loopDuration / 10000;
+	global_joules += (uint32_t)sdata->deciwatts * (millis() - lastStateUpdate) / 10000;
+	lastStateUpdate = millis();
 
-	if(sdataLast->millivolts - sdata->millivolts > 5000) {	// Crashed 5V in 1s
-		before_crash_wiper = MCPWiper;
-		setWiper((uint32_t)sdata->millivolts * MCPWiper / sdataLast->millivolts);
-	} else if(sdata->millivolts < minVoltage) {	// Under-production
-		decreasePower();
-		exploration_direction = true;
-	} else if(before_crash_wiper > 0) {
-		setWiper(before_crash_wiper - 1 - before_crash_wiper / power_reactivity_scaling);
-		before_crash_wiper = 0;
-	} else if(sdata->millivolts > maxVoltage) {	// Over-production/Ouput limited
-		increasePower();
-		exploration_direction = false;
-	} else {
-		// Random walk within [minV, maxV]
-		if(sdataLast->deciwatts > sdata->deciwatts) {
-			exploration_direction = !exploration_direction;
+	if(!wiper_locked) {
+		if(sdataLast->millivolts - sdata->millivolts > 5000) {	// Crashed 5V in 1s
+			before_crash_wiper = MCPWiper;
+			setWiper((uint32_t)sdata->millivolts * MCPWiper / sdataLast->millivolts);
+		} else if(sdata->millivolts < minVoltage) {	// Under-production
+			decreasePower();
+			exploration_direction = true;
+		} else if(before_crash_wiper > 0) {
+			setWiper(before_crash_wiper - 1 - before_crash_wiper / power_reactivity_scaling);
+			before_crash_wiper = 0;
+		} else if(sdata->millivolts > maxVoltage) {	// Over-production/Ouput limited
+			increasePower();
+			exploration_direction = false;
+		} else {
+			// Random walk within [minV, maxV]
+			if(sdataLast->deciwatts > sdata->deciwatts) {
+				exploration_direction = !exploration_direction;
+			}
+			moveWiper(exploration_direction);
 		}
-		moveWiper(exploration_direction);
 	}
 
 	if(!MCPWiper) {	// Handle going to sleep
 		if(crashCount > sleepCrashCount) {
 			if(!sleep) {
 				pac.SetStandby(true);	// Sleep if running
+				serial_state = MAGIC1;	// Reset serial state
 				sleep = true;
 			}
 		} else {
@@ -141,12 +175,6 @@ void loop() {
 			sleep = false;
 		}
 		crashCount = 0;
-	}
-
-	if(Serial.read() == serial_identity) {
-		sdata.joules = global_joules;
-		Serial.write((unsigned char*)(&sdata), sizeof(sdata));
-		global_joules = 0;
 	}
 
 	byte tensOfVolts = sdata->millivolts / 10000;
@@ -180,8 +208,43 @@ void loop() {
 	sdata = sdataLast;
 	sdataLast = t;
 
-	if(sleep) LowPower.powerDown(SLEEP_8S, ADC_ON, BOD_ON);
-	else delay(loopTime);
+	if(sleep) {
+		// millis are not counted when sleeping.
+		// We need to add 8000ms by decreasing lastStateUpdate by the same amount if possible.
+		if(lastStateUpdate < 8000) lastStateUpdate = 0; else lastStateUpdate -= 8000;
+		LowPower.powerDown(SLEEP_8S, ADC_ON, BOD_ON);
+	}
+}
 
-	loopDuration = millis() - loopStartTime;
+void serialEvent() {
+	do {
+		switch(serial_state) {
+		case MAGIC1:
+			if(Serial.read() == cmd_magic[0]) serial_state = MAGIC2;
+			break;
+		case MAGIC2:
+			if(Serial.read() == cmd_magic[1]) serial_state = MAGIC3;
+			else serial_state = MAGIC1;
+			break;
+		case MAGIC3:
+			if(Serial.read() == cmd_magic[2]) serial_state = MAGIC4;
+			else serial_state = MAGIC1;
+			break;
+		case MAGIC4:
+			if(Serial.read() == cmd_magic[3]) serial_state = IDENTITY;
+			else serial_state = MAGIC1;
+			break;
+		case IDENTITY:
+			if(Serial.read() == serial_identity) serial_state = COMMAND;
+			else serial_state = MAGIC1;
+			break;
+		case COMMAND:
+			runCommand((CommandID)Serial.read());
+			break;
+		}
+	} while(Serial.available());
+}
+
+void loop() {
+	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
 }
