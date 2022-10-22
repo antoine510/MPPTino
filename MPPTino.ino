@@ -79,6 +79,7 @@ void setup() {
 	ST7565::drawchar_aligned(4, 4, 'W');
 }
 
+constexpr unsigned crashVoltage = 25000;
 constexpr unsigned minVoltage = 30000, maxVoltage = 35000;
 bool wiper_locked = false;
 
@@ -138,7 +139,7 @@ void updateState() {
 	lastStateUpdate = millis();
 
 	if(!wiper_locked) {
-		if(sdataLast->millivolts - sdata->millivolts > 5000) {	// Crashed 5V in 1s
+		if(sdataLast->millivolts > crashVoltage && sdata->millivolts < crashVoltage) {
 			before_crash_wiper = MCPWiper;
 			setWiper((uint32_t)sdata->millivolts * MCPWiper / sdataLast->millivolts);
 		} else if(sdata->millivolts < minVoltage) {	// Under-production
