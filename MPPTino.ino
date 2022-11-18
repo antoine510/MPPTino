@@ -44,11 +44,11 @@ void setWiper(uint8_t value) {
 }
 
 void moveWiper(bool decrement) {
+	if((decrement && MCPWiper == 0) || (!decrement && MCPWiper == max_wiper)) return;	// OOB
 	Wire.beginTransmission(MCP4561address);
 	Wire.write(0x04 << decrement); // Inc/Dec address 0 (wiper volatile)
 	Wire.endTransmission();
-	if(!(decrement && MCPWiper == 0) && !(!decrement && MCPWiper == max_wiper))
-		MCPWiper += 1 - 2 * decrement;
+	MCPWiper += decrement ? -1 : 1;
 }
 
 
@@ -56,12 +56,12 @@ void setup() {
 	ADCSRA &= ~(1 << ADEN); // Disable ADC
 
 	Serial.begin(9600);
-	Serial.setTimeout(200);
 	serial_state = MAGIC1;
+	
 	Wire.begin();
 	setWiper(0);
 	pac.SetSamplingTimesMs(20, 80);
-	pac.SetAveraging(PAC1710::AVG_NONE, PAC1710::AVG_8);
+	pac.SetAveraging(PAC1710::AVG_8, PAC1710::AVG_8);
 	pac.SetSenseScale(PAC1710::SS_80MV);
 
 	sdata = new SerialData{};
@@ -79,35 +79,13 @@ void setup() {
 	ST7565::drawchar_aligned(4, 4, 'W');
 }
 
-constexpr unsigned crashVoltage = 25000;
-constexpr unsigned minVoltage = 30000, maxVoltage = 35000;
+constexpr unsigned minVoltage = 31000, maxVoltage = 34500;
 bool wiper_locked = false;
 
-/**
- * @brief Modulates reactivity to over or under voltage with power
- * 2^n only, higher is less reactive at high power
- * Ex: V > maxV => MCP += 1 + MCP / power_reactivity_scaling
- */
-constexpr uint8_t power_reactivity_scaling = 32;
 
-// True for descreasing power, false for increasing power
-bool exploration_direction = false;
-uint8_t before_crash_wiper = 0;
-
-constexpr unsigned long stateUpdatePeriod = 1000ul;
+constexpr unsigned long stateUpdatePeriod = 200ul;
 byte crashCount = 0;
 constexpr byte sleepCrashCount = 5; // If we have been under the crash voltage for more than sleepCrashCount * loopTime, sleep
-
-void decreasePower() {
-	uint8_t dec = 1 + MCPWiper / power_reactivity_scaling;	// Decrease amperage proportionally to current power
-	if(MCPWiper <= dec) setWiper(0);
-	else setWiper(MCPWiper - dec);
-}
-void increasePower() {
-	uint8_t inc = 1 + MCPWiper / power_reactivity_scaling;	// Increase amperage proportionally to current power
-	if((max_wiper - MCPWiper) <= inc) setWiper(max_wiper);
-	else setWiper(MCPWiper + inc);
-}
 
 void runCommand(CommandID command) {
 	switch(command) {
@@ -118,6 +96,7 @@ void runCommand(CommandID command) {
 		break;
 	case SET_MAX_WIPER:
 		Serial.readBytes(&max_wiper, 1);
+		if(MCPWiper > max_wiper) setWiper(max_wiper);
 		break;
 	case SET_OUTPUT_ENABLED:
 	case SET_OUTPUT_ENABLED+1:
@@ -135,28 +114,14 @@ void updateState() {
 	sdata->milliamps = abs(PACReader::GetCurrentI(pac));
 	sdata->deciwatts = PACReader::GetPowerI(pac);
 
-	global_joules += (uint32_t)sdata->deciwatts * (millis() - lastStateUpdate) / 10000;
+	global_joules += (uint32_t)sdata->deciwatts * (uint32_t)(millis() - lastStateUpdate) / 10000;
 	lastStateUpdate = millis();
 
 	if(!wiper_locked) {
-		if(sdataLast->millivolts > crashVoltage && sdata->millivolts < crashVoltage) {
-			before_crash_wiper = MCPWiper;
-			setWiper((uint32_t)sdata->millivolts * MCPWiper / sdataLast->millivolts);
-		} else if(sdata->millivolts < minVoltage) {	// Under-production
-			decreasePower();
-			exploration_direction = true;
-		} else if(before_crash_wiper > 0) {
-			setWiper(before_crash_wiper - 1 - before_crash_wiper / power_reactivity_scaling);
-			before_crash_wiper = 0;
-		} else if(sdata->millivolts > maxVoltage) {	// Over-production/Ouput limited
-			increasePower();
-			exploration_direction = false;
-		} else {
-			// Random walk within [minV, maxV]
-			if(sdataLast->deciwatts > sdata->deciwatts) {
-				exploration_direction = !exploration_direction;
-			}
-			moveWiper(exploration_direction);
+		if(sdata->millivolts < minVoltage) {
+			moveWiper(true);
+		} else if(sdata->millivolts > (maxVoltage - MCPWiper * 6)) {
+			moveWiper(false);
 		}
 	}
 
