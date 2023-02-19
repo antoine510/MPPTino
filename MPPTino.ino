@@ -1,11 +1,11 @@
-#ifndef __AVR_ATmega328P__
-#define __AVR_ATmega328P__
-#endif
-
-#include <Wire.h>
-#include <PAC1710.h>
 #include <ST7565.h>
-#include <LowPower.h>
+#include <MCP4716.h>
+
+enum Pins {
+	PIN_VIN = A1,
+	PIN_VOUT = A2,
+	PIN_IOUT = A3
+};
 
 static constexpr const int serial_identity = 0x01;
 static constexpr const byte cmd_magic[] = {0x4f, 0xc7, 0xb2, 0x9a};
@@ -14,55 +14,28 @@ enum SerialState : uint8_t {
 } serial_state;
 enum CommandID : uint8_t {
 	READ_ALL = 0x01,
-	SET_MAX_WIPER = 0x02,		// Max wiper is next byte
-	SET_OUTPUT_ENABLED = 0x04	// 0b0000010e, e is output enable bit
+	SET_MPP_VOLTAGE_MV = 0x02,	// Manually set MPP voltage in millivolts
 };
 
-const uint8_t MCP4561address = 0x2e;
-uint8_t max_wiper = 0xff;
-uint8_t MCPWiper = 0;
-
-PAC1710 pac;
-typedef PAC1710::ValueReader<2, PAC1710::SS_80MV> PACReader;
-bool sleep = false;
-
 struct SerialData {
-	uint16_t millivolts;
-	uint16_t milliamps;
-	uint16_t deciwatts;
-	uint16_t joules;
+	uint16_t vin_cv;
+	uint16_t vout_dv;
+	uint16_t iout_ca;
+	uint16_t pout_dw;
+	uint16_t eout_j;
 };
 SerialData* sdata, *sdataLast;
 uint16_t global_joules = 0;
-
-void setWiper(uint8_t value) {
-	Wire.beginTransmission(MCP4561address);
-	Wire.write(0x00); // Write command to address 0 (wiper volatile)
-	Wire.write(value);
-	Wire.endTransmission();
-	MCPWiper = value;
-}
-
-void moveWiper(bool decrement) {
-	if((decrement && MCPWiper == 0) || (!decrement && MCPWiper == max_wiper)) return;	// OOB
-	Wire.beginTransmission(MCP4561address);
-	Wire.write(0x04 << decrement); // Inc/Dec address 0 (wiper volatile)
-	Wire.endTransmission();
-	MCPWiper += decrement ? -1 : 1;
-}
-
 
 void setup() {
 	ADCSRA &= ~(1 << ADEN); // Disable ADC
 
 	Serial.begin(9600);
 	serial_state = MAGIC1;
-	
-	Wire.begin();
-	setWiper(0);
-	pac.SetSamplingTimesMs(20, 80);
-	pac.SetAveraging(PAC1710::AVG_8, PAC1710::AVG_8);
-	pac.SetSenseScale(PAC1710::SS_80MV);
+
+	pinMode(PIN_VIN, INPUT);
+	pinMode(PIN_VOUT, INPUT);
+	pinMode(PIN_IOUT, INPUT);
 
 	sdata = new SerialData{};
 	sdataLast = new SerialData{};
@@ -74,34 +47,27 @@ void setup() {
 	ST7565::drawchar_aligned(4, 0, 'V');
 
 	ST7565::drawchar_aligned(2, 2, '.');
-	ST7565::drawchar_aligned(5, 2, 'A');
+	ST7565::drawchar_aligned(4, 2, 'V');
 
-	ST7565::drawchar_aligned(4, 4, 'W');
+	ST7565::drawchar_aligned(2, 4, '.');
+	ST7565::drawchar_aligned(5, 4, 'A');
+
+	ST7565::drawchar_aligned(4, 6, 'W');
 }
 
-constexpr unsigned minVoltage = 31000, maxVoltage = 34500;
-bool wiper_locked = false;
-
+uint16_t mpp_voltage_mv = 33000;
 
 constexpr unsigned long stateUpdatePeriod = 200ul;
-byte crashCount = 0;
-constexpr byte sleepCrashCount = 5; // If we have been under the crash voltage for more than sleepCrashCount * loopTime, sleep
 
 void runCommand(CommandID command) {
 	switch(command) {
 	case READ_ALL:
-		sdata->joules = global_joules;
+		sdata->eout_j = global_joules;
 		Serial.write((byte*)(sdata), sizeof(SerialData));
 		global_joules = 0;
 		break;
-	case SET_MAX_WIPER:
-		Serial.readBytes(&max_wiper, 1);
-		if(MCPWiper > max_wiper) setWiper(max_wiper);
-		break;
-	case SET_OUTPUT_ENABLED:
-	case SET_OUTPUT_ENABLED+1:
-		wiper_locked = !(command & 0b00000001);
-		if(wiper_locked) setWiper(0);
+	case SET_MPP_VOLTAGE_MV:
+		Serial.readBytes((uint8_t*)&mpp_voltage_mv, sizeof(mpp_voltage_mv));
 		break;
 	}
 	serial_state = MAGIC1;	// Done with command, reset serial state
@@ -109,77 +75,43 @@ void runCommand(CommandID command) {
 
 unsigned long lastStateUpdate = 0;
 void updateState() {
-	pac.ReadOnce(PAC1710::READ_ALL);
-	sdata->millivolts = PACReader::GetVoltageI(pac);
-	sdata->milliamps = abs(PACReader::GetCurrentI(pac));
-	sdata->deciwatts = PACReader::GetPowerI(pac);
-
-	global_joules += (uint32_t)sdata->deciwatts * (uint32_t)(millis() - lastStateUpdate) / 10000;
-	lastStateUpdate = millis();
-
-	if(!wiper_locked) {
-		if(sdata->millivolts < minVoltage) {
-			moveWiper(true);
-		} else if(sdata->millivolts > (maxVoltage - MCPWiper * 6)) {
-			moveWiper(false);
-		}
-	}
-
-	if(!MCPWiper) {	// Handle going to sleep
-		if(crashCount > sleepCrashCount) {
-			if(!sleep) {
-				pac.SetStandby(true);	// Sleep if running
-				serial_state = MAGIC1;	// Reset serial state
-				sleep = true;
-			}
-		} else {
-			++crashCount;
-		}
-	} else {
-		if(sleep) {
-			pac.SetStandby(false);	// Wakeup if sleeping
-			sleep = false;
-		}
-		crashCount = 0;
-	}
-
-	byte tensOfVolts = sdata->millivolts / 10000;
-	ST7565::drawchar_aligned(0, 0, tensOfVolts ? tensOfVolts + 48 : 0);
-	ST7565::drawchar_aligned(1, 0, (sdata->millivolts / 1000) % 10 + 48);
-	ST7565::drawchar_aligned(3, 0, (sdata->millivolts / 100) % 10 + 48);
-
-	byte tensOfAmps = sdata->milliamps / 10000;
-	ST7565::drawchar_aligned(0, 2, tensOfAmps ? tensOfAmps + 48 : 0);
-	ST7565::drawchar_aligned(1, 2, (sdata->milliamps / 1000) % 10 + 48);
-	ST7565::drawchar_aligned(3, 2, (sdata->milliamps / 100) % 10 + 48);
-	ST7565::drawchar_aligned(4, 2, (sdata->milliamps / 10) % 10 + 48);
-
-	byte thousandsOfWatts = sdata->deciwatts / 10000;
-	byte hundredsOfWatts = (sdata->deciwatts / 1000) % 10;
-	byte tensOfWatts = (sdata->deciwatts / 100) % 10;
-	ST7565::drawchar_aligned(0, 4, thousandsOfWatts ? thousandsOfWatts + 48 : 0);
-	ST7565::drawchar_aligned(1, 4, (hundredsOfWatts || thousandsOfWatts) ? hundredsOfWatts + 48 : 0);
-	ST7565::drawchar_aligned(2, 4, (tensOfWatts || hundredsOfWatts || thousandsOfWatts) ? tensOfWatts + 48 : 0);
-	ST7565::drawchar_aligned(3, 4, (sdata->deciwatts / 10) % 10 + 48);
-
-	byte hundredsOfMCP = MCPWiper / 100;
-	byte tensOfMCP = (MCPWiper / 10) % 10;
-	ST7565::drawchar_aligned(0, 6, hundredsOfMCP ? hundredsOfMCP + 48 : 0);
-	ST7565::drawchar_aligned(1, 6, (tensOfMCP || hundredsOfMCP) ? tensOfMCP + 48 : 0);
-	ST7565::drawchar_aligned(2, 6, MCPWiper % 10 + 48);
-
-	ST7565::display();
-
 	SerialData* t = sdata;
 	sdata = sdataLast;
 	sdataLast = t;
 
-	if(sleep) {
-		// millis are not counted when sleeping.
-		// We need to add 8000ms by decreasing lastStateUpdate by the same amount if possible.
-		if(lastStateUpdate < 8000) lastStateUpdate = 0; else lastStateUpdate -= 8000;
-		LowPower.powerDown(SLEEP_8S, ADC_ON, BOD_ON);
-	}
+	sdata->vin_cv = analogRead(PIN_VIN) * 45 / 10;
+	sdata->vout_dv = (uint32_t)analogRead(PIN_VOUT) * 10264 / 10000;
+	sdata->iout_ca = (uint32_t)analogRead(PIN_IOUT) * 16292 / 10000;
+	sdata->pout_dw = (uint32_t)sdata->vout_dv * sdata->iout_ca / 100;
+
+	global_joules += (uint32_t)sdata->pout_dw * (uint32_t)(millis() - lastStateUpdate) / 10000;
+	lastStateUpdate = millis();
+
+	byte tensOfVolts = sdata->vin_cv / 1000;
+	ST7565::drawchar_aligned(0, 0, tensOfVolts ? tensOfVolts + 48 : 0);
+	ST7565::drawchar_aligned(1, 0, (sdata->vin_cv / 100) % 10 + 48);
+	ST7565::drawchar_aligned(3, 0, (sdata->vin_cv / 10) % 10 + 48);
+
+	tensOfVolts = sdata->vout_dv / 100;
+	ST7565::drawchar_aligned(0, 2, tensOfVolts ? tensOfVolts + 48 : 0);
+	ST7565::drawchar_aligned(1, 2, (sdata->vout_dv / 10) % 10 + 48);
+	ST7565::drawchar_aligned(3, 2, sdata->vout_dv % 10 + 48);
+
+	byte tensOfAmps = sdata->iout_ca / 1000;
+	ST7565::drawchar_aligned(0, 4, tensOfAmps ? tensOfAmps + 48 : 0);
+	ST7565::drawchar_aligned(1, 4, (sdata->iout_ca / 100) % 10 + 48);
+	ST7565::drawchar_aligned(3, 4, (sdata->iout_ca / 10) % 10 + 48);
+	ST7565::drawchar_aligned(4, 4, sdata->iout_ca % 10 + 48);
+
+	byte thousandsOfWatts = sdata->pout_dw / 10000;
+	byte hundredsOfWatts = (sdata->pout_dw / 1000) % 10;
+	byte tensOfWatts = (sdata->pout_dw / 100) % 10;
+	ST7565::drawchar_aligned(0, 6, thousandsOfWatts ? thousandsOfWatts + 48 : 0);
+	ST7565::drawchar_aligned(1, 6, (hundredsOfWatts || thousandsOfWatts) ? hundredsOfWatts + 48 : 0);
+	ST7565::drawchar_aligned(2, 6, (tensOfWatts || hundredsOfWatts || thousandsOfWatts) ? tensOfWatts + 48 : 0);
+	ST7565::drawchar_aligned(3, 6, (sdata->pout_dw / 10) % 10 + 48);
+
+	ST7565::display();
 }
 
 void serialEvent() {

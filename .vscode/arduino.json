@@ -1,7 +1,6 @@
 {
-    "board": "arduino:avr:pro",
-    "programmer": "arduino:usbasp",
-    "configuration": "cpu=1MHzatmega328",
     "output": "build/",
-    "sketch": "MPPTino.ino"
+    "sketch": "MPPTino.ino",
+    "configuration": "bootloader=no_bootloader,eeprom=erase,variant=modelPB,BOD=4v3,LTO=Os,clock=8MHz_internal",
+    "board": "MiniCore:avr:328"
 }
