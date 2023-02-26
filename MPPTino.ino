@@ -27,9 +27,9 @@ struct SerialData {
 SerialData* sdata, *sdataLast;
 uint16_t global_joules = 0;
 
-void setup() {
-	ADCSRA &= ~(1 << ADEN); // Disable ADC
+MCP4716 dac;
 
+void setup() {
 	Serial.begin(9600);
 	serial_state = MAGIC1;
 
@@ -53,11 +53,13 @@ void setup() {
 	ST7565::drawchar_aligned(5, 4, 'A');
 
 	ST7565::drawchar_aligned(4, 6, 'W');
+
+  dac.SetValue(700);
 }
 
 uint16_t mpp_voltage_mv = 33000;
 
-constexpr unsigned long stateUpdatePeriod = 200ul;
+constexpr unsigned long stateUpdatePeriod = 1000ul;
 
 void runCommand(CommandID command) {
 	switch(command) {
@@ -79,7 +81,7 @@ void updateState() {
 	sdata = sdataLast;
 	sdataLast = t;
 
-	sdata->vin_cv = analogRead(PIN_VIN) * 45 / 10;
+	sdata->vin_cv = (uint16_t)analogRead(PIN_VIN) * 45 / 10;
 	sdata->vout_dv = (uint32_t)analogRead(PIN_VOUT) * 10264 / 10000;
 	sdata->iout_ca = (uint32_t)analogRead(PIN_IOUT) * 16292 / 10000;
 	sdata->pout_dw = (uint32_t)sdata->vout_dv * sdata->iout_ca / 100;
