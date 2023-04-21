@@ -83,7 +83,7 @@ void updateState() {
 
 	sdata->vin_cv = (uint16_t)analogRead(PIN_VIN) * 45 / 10;
 	sdata->vout_dv = (uint32_t)analogRead(PIN_VOUT) * 10264 / 10000;
-	sdata->iout_ca = (uint32_t)analogRead(PIN_IOUT) * 16292 / 10000;
+	sdata->iout_ca = (uint16_t)(analogRead(PIN_IOUT) + 2) * 14 / 9;
 	sdata->pout_dw = (uint32_t)sdata->vout_dv * sdata->iout_ca / 100;
 
 	global_joules += (uint32_t)sdata->pout_dw * (uint32_t)(millis() - lastStateUpdate) / 10000;
