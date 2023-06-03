@@ -78,8 +78,8 @@ void runCommand(CommandID command) {
 
 unsigned long lastStateUpdate = 0;
 void updateState() {
-	sdata.vin_cv = (uint16_t)analogRead(PIN_VIN) * 45 / 10;
-	sdata.vout_dv = (uint32_t)analogRead(PIN_VOUT) * 10264 / 10000;
+	sdata.vin_cv = (uint32_t)analogRead(PIN_VIN) * 199 / 44;
+	sdata.vout_dv = (uint16_t)analogRead(PIN_VOUT) * 39 / 38;
 	sdata.iout_ca = (uint16_t)(analogRead(PIN_IOUT) + 2) * 14 / 9;
 	sdata.pout_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
 
