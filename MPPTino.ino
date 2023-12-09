@@ -1,3 +1,4 @@
+#include <EEPROM.h>
 #include <ST7565.h>
 #include <MCP4716.h>
 #include <OneWire.h>	// For DS18B20
@@ -5,14 +6,10 @@
 enum Pins {
 	PIN_VIN = A1,
 	PIN_VOUT = A2,
-	PIN_IOUT = A3
+	PIN_IOUT = A3,
+  PIN_TEMPERATURE = 9
 };
 
-static constexpr const int serial_identity = 0x01;
-static constexpr const byte cmd_magic[] = {0x4f, 0xc7, 0xb2, 0x9a};
-enum SerialState : uint8_t {
-	MAGIC1, MAGIC2, MAGIC3, MAGIC4, IDENTITY, COMMAND
-} serial_state;
 enum CommandID : uint8_t {
 	NONE,
 	READ_ALL,
@@ -36,7 +33,7 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 }
 
 int8_t GetTemperature() {
-	static OneWire tsens(9);
+	static OneWire tsens(PIN_TEMPERATURE);
 
 	tsens.reset();
 	tsens.skip();
@@ -52,26 +49,12 @@ int8_t GetTemperature() {
 
 void setup() {
 	Serial.begin(9600);
-	serial_state = MAGIC1;
 
 	pinMode(PIN_VIN, INPUT);
 	pinMode(PIN_VOUT, INPUT);
 	pinMode(PIN_IOUT, INPUT);
 
-	ST7565::begin(0x03);
-	ST7565::clear();
-
-	ST7565::drawchar_aligned(2, 0, '.');
-
-	ST7565::drawchar_aligned(7, 0, '.');
-	ST7565::drawchar_aligned(9, 0, 'V');
-
-	ST7565::drawchar_aligned(3, 2, 'C');
-
-	ST7565::drawchar_aligned(2, 4, '.');
-	ST7565::drawchar_aligned(5, 4, 'A');
-
-	ST7565::drawchar_aligned(4, 6, 'W');
+	setupLCD();
 
 	SetMPPVoltage(320);
 }
@@ -91,7 +74,6 @@ void runCommand(CommandID command) {
 		SetMPPVoltage(mppv_dv);
 		break;
 	}
-	serial_state = MAGIC1;	// Done with command, reset serial state
 }
 
 unsigned long lastStateUpdate = 0;
@@ -105,7 +87,57 @@ void updateState() {
 	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
 	lastStateUpdate = millis();
 
-	byte tensOfVolts = sdata.vin_cv / 1000;
+	updateLCD();
+}
+
+
+enum SerialSeq : uint8_t {
+	MAGIC1, MAGIC2, MAGIC3, MAGIC4, IDENTITY, COMMAND
+} serial_state = MAGIC1;
+
+uint8_t updateSerialState(uint8_t byte) {
+  static constexpr const uint8_t cmd_magic[] = {0x4f, 0xc7, 0xb2, 0x9a};
+  switch(serial_state) {
+		case MAGIC1: return byte == cmd_magic[0] ? MAGIC2 : MAGIC1;
+		case MAGIC2: return byte == cmd_magic[1] ? MAGIC3 : MAGIC1;
+		case MAGIC3: return byte == cmd_magic[2] ? MAGIC4 : MAGIC1;
+		case MAGIC4: return byte == cmd_magic[3] ? IDENTITY : MAGIC1;
+		case IDENTITY: return byte == EEPROM.read(0) ? COMMAND : MAGIC1;
+		case COMMAND: runCommand((CommandID)byte); return MAGIC1;
+	}
+}
+
+
+void serialEvent() {
+	do {
+    serial_state = (SerialSeq)updateSerialState(Serial.read());
+	} while(Serial.available());
+}
+
+
+void loop() {
+	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
+}
+
+void setupLCD() {
+  ST7565::begin(0x03);
+	ST7565::clear();
+
+	ST7565::drawchar_aligned(2, 0, '.');
+
+	ST7565::drawchar_aligned(7, 0, '.');
+	ST7565::drawchar_aligned(9, 0, 'V');
+
+	ST7565::drawchar_aligned(3, 2, 'C');
+
+	ST7565::drawchar_aligned(2, 4, '.');
+	ST7565::drawchar_aligned(5, 4, 'A');
+
+	ST7565::drawchar_aligned(4, 6, 'W');
+}
+
+void updateLCD() {
+  byte tensOfVolts = sdata.vin_cv / 1000;
 	ST7565::drawchar_aligned(0, 0, tensOfVolts ? tensOfVolts + 48 : 0);
 	ST7565::drawchar_aligned(1, 0, (sdata.vin_cv / 100) % 10 + 48);
 	ST7565::drawchar_aligned(3, 0, (sdata.vin_cv / 10) % 10 + 48);
@@ -140,37 +172,4 @@ void updateState() {
 	ST7565::drawchar_aligned(3, 6, (sdata.pout_dw / 10) % 10 + 48);
 
 	ST7565::display();
-}
-
-void serialEvent() {
-	do {
-		switch(serial_state) {
-		case MAGIC1:
-			if(Serial.read() == cmd_magic[0]) serial_state = MAGIC2;
-			break;
-		case MAGIC2:
-			if(Serial.read() == cmd_magic[1]) serial_state = MAGIC3;
-			else serial_state = MAGIC1;
-			break;
-		case MAGIC3:
-			if(Serial.read() == cmd_magic[2]) serial_state = MAGIC4;
-			else serial_state = MAGIC1;
-			break;
-		case MAGIC4:
-			if(Serial.read() == cmd_magic[3]) serial_state = IDENTITY;
-			else serial_state = MAGIC1;
-			break;
-		case IDENTITY:
-			if(Serial.read() == serial_identity) serial_state = COMMAND;
-			else serial_state = MAGIC1;
-			break;
-		case COMMAND:
-			runCommand((CommandID)Serial.read());
-			break;
-		}
-	} while(Serial.available());
-}
-
-void loop() {
-	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
 }
