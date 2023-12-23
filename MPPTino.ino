@@ -28,8 +28,20 @@ SerialData sdata;
 uint32_t eout_mj = 0;
 
 MCP4716 dac;
+static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
+uint16_t dacValue = 740;
 void SetMPPVoltage(uint16_t mppv_dv) {
-	dac.SetValue((mppv_dv * 17) / 10 + 196);
+  dacValue = (mppv_dv * 17) / 10 + 196;
+	dac.SetValue(dacValue);
+}
+bool NudgeMPP(bool increase) {
+  dacValue += increase * 2 - 1;
+  bool saturated = true;
+  if(dacValue < dacMin) dacValue = dacMin;
+  else if(dacValue > dacMax) dacValue = dacMax;
+  else saturated = false;
+  dac.SetValue(dacValue);
+  return saturated;
 }
 
 int8_t GetTemperature() {
@@ -78,11 +90,18 @@ void runCommand(CommandID command) {
 
 unsigned long lastStateUpdate = 0;
 void updateState() {
+  static bool nudge = true;
+  static uint32_t lastPower = 0;
 	sdata.vin_cv = (uint32_t)analogRead(PIN_VIN) * 199 / 44;
 	sdata.vout_dv = (uint16_t)analogRead(PIN_VOUT) * 39 / 38;
 	sdata.iout_ca = (uint16_t)(analogRead(PIN_IOUT) + 2) * 14 / 9;
-	sdata.pout_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
+  uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
+	sdata.pout_dw = pout_mw / 100;
 	sdata.temp_c = GetTemperature();
+
+  if(pout_mw < lastPower) nudge = !nudge;
+  if(NudgeMPP(nudge)) nudge = !nudge;
+  lastPower = pout_mw;
 
 	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
 	lastStateUpdate = millis();
