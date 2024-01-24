@@ -7,13 +7,16 @@ enum Pins {
 	PIN_VIN = A1,
 	PIN_VOUT = A2,
 	PIN_IOUT = A3,
-  PIN_TEMPERATURE = 9
+  PIN_TEMPERATURE = 9,
+  PIN_TXEN = 2
 };
 
 enum CommandID : uint8_t {
 	NONE,
 	READ_ALL,
-	SET_MPP_VOLTAGE_DV,	// Manually set MPP voltage in decivolts
+	SET_MPP_MANUAL_DV,	// Manually set MPP voltage in decivolts
+  SET_MPP_AUTO,
+  SET_MAX_TEMP_C  // Set maximum allowed temperature in celcius
 };
 
 struct SerialData {
@@ -28,12 +31,19 @@ SerialData sdata;
 uint32_t eout_mj = 0;
 
 MCP4716 dac;
-static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
-uint16_t dacValue = 740;
+static constexpr const uint16_t dacMin = 672, dacMax = 876; // 28V - 40V
+constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) {
+  return (mppv_dv * 17) / 10 + 196;
+}
+uint16_t dacValue = VoltageToDAC(320);  // 32V default MPP voltage
+uint16_t manualMPP = 0; // 0 for automatic
+
 void SetMPPVoltage(uint16_t mppv_dv) {
-  dacValue = (mppv_dv * 17) / 10 + 196;
+  manualMPP = mppv_dv;
+  dacValue = VoltageToDAC(mppv_dv);
 	dac.SetValue(dacValue);
 }
+
 bool NudgeMPP(bool increase) {
   dacValue += increase * 2 - 1;
   bool saturated = true;
@@ -43,6 +53,8 @@ bool NudgeMPP(bool increase) {
   dac.SetValue(dacValue);
   return saturated;
 }
+
+int8_t maxTemperature = 80;
 
 int8_t GetTemperature() {
 	static OneWire tsens(PIN_TEMPERATURE);
@@ -66,9 +78,19 @@ void setup() {
 	pinMode(PIN_VOUT, INPUT);
 	pinMode(PIN_IOUT, INPUT);
 
+  pinMode(PIN_TXEN, OUTPUT);
+  digitalWrite(PIN_TXEN, LOW);
+
 	setupLCD();
 
-	SetMPPVoltage(320);
+	dac.SetValue(dacValue); // Initialize DAC to startup value
+}
+
+void SendRS485(uint8_t* data, size_t len) {
+  digitalWrite(PIN_TXEN, HIGH);
+  Serial.write(data, len);
+  Serial.flush();
+  digitalWrite(PIN_TXEN, LOW);
 }
 
 constexpr unsigned long stateUpdatePeriod = 1000ul;
@@ -79,12 +101,18 @@ void runCommand(CommandID command) {
 	case READ_ALL:
 		sdata.eout_j = eout_mj / 1000;
 		eout_mj = 0;
-		Serial.write((uint8_t*)(&sdata), sizeof(SerialData));
+    SendRS485((uint8_t*)(&sdata), sizeof(SerialData));
 		break;
-	case SET_MPP_VOLTAGE_DV:
+	case SET_MPP_MANUAL_DV:
 		Serial.readBytes((uint8_t*)&mppv_dv, sizeof(mppv_dv));
 		SetMPPVoltage(mppv_dv);
 		break;
+  case SET_MPP_AUTO:
+    manualMPP = 0;
+    break;
+  case SET_MAX_TEMP_C:
+    maxTemperature = (int8_t)Serial.read();
+    break;
 	}
 }
 
@@ -99,9 +127,16 @@ void updateState() {
 	sdata.pout_dw = pout_mw / 100;
 	sdata.temp_c = GetTemperature();
 
-  if(pout_mw < lastPower) nudge = !nudge;
-  if(NudgeMPP(nudge)) nudge = !nudge;
-  lastPower = pout_mw;
+  if(sdata.temp_c > maxTemperature) {
+    NudgeMPP(true);
+  } else if(manualMPP && dacValue != VoltageToDAC(manualMPP)) {
+    SetMPPVoltage(manualMPP);
+  } else {
+    if(pout_mw < lastPower) nudge = !nudge;
+    bool saturated = NudgeMPP(nudge);
+    if(saturated) nudge = !nudge;   // Switch direction on saturation
+    lastPower = pout_mw;
+  }
 
 	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
 	lastStateUpdate = millis();
@@ -127,15 +162,12 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 
-void serialEvent() {
-	do {
-    serial_state = (SerialSeq)updateSerialState(Serial.read());
-	} while(Serial.available());
-}
-
-
 void loop() {
 	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
+
+  while(Serial.available()) {
+    serial_state = (SerialSeq)updateSerialState(Serial.read());
+	}
 }
 
 void setupLCD() {
