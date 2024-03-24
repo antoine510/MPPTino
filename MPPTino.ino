@@ -2,6 +2,8 @@
 #include <ST7565.h>
 #include <MCP4716.h>
 
+static constexpr const uint8_t MAGIC_NUMBER = 0x42;
+
 enum Pins {
 	PIN_VIN = A1,
 	PIN_VOUT = A2,
@@ -10,10 +12,10 @@ enum Pins {
 };
 
 enum CommandID : uint8_t {
-	NONE,
-	READ_ALL,
-	SET_MPP_MANUAL_DV,	// Manually set MPP voltage in decivolts
-  SET_MPP_AUTO
+	MAGIC = 0x0,
+	READ_ALL = 0x1,
+	SET_MPP_MANUAL_DV = 0x2,	// Manually set MPP voltage in decivolts
+  SET_MPP_AUTO = 0x3
 };
 
 struct SerialData {
@@ -35,8 +37,9 @@ uint16_t dacValue = VoltageToDAC(320);  // 32V default MPP voltage
 uint16_t manualMPP = 0; // 0 for automatic
 
 void SetMPPVoltage(uint16_t mppv_dv) {
-  manualMPP = mppv_dv;
-  dacValue = VoltageToDAC(mppv_dv);
+  auto newDACValue = VoltageToDAC(mppv_dv);
+  if(newDACValue == dacValue) return;
+  dacValue = newDACValue;
 	dac.SetValue(dacValue);
 }
 
@@ -67,6 +70,7 @@ void setup() {
 
 void SendRS485(uint8_t* data, size_t len) {
   digitalWrite(PIN_TXEN, HIGH);
+  delay(1);
   Serial.write(data, len);
   Serial.flush();
   digitalWrite(PIN_TXEN, LOW);
@@ -75,17 +79,19 @@ void SendRS485(uint8_t* data, size_t len) {
 constexpr unsigned long stateUpdatePeriod = 1000ul;
 
 void runCommand(CommandID command) {
-	uint16_t mppv_dv;
 	switch(command) {
+  case MAGIC:
+    SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER));
+    break;
 	case READ_ALL:
 		sdata.eout_j = eout_mj / 1000;
 		eout_mj = 0;
     SendRS485((uint8_t*)(&sdata), sizeof(SerialData));
 		break;
 	case SET_MPP_MANUAL_DV:
-		Serial.readBytes((uint8_t*)&mppv_dv, sizeof(mppv_dv));
-		SetMPPVoltage(mppv_dv);
-		break;
+    Serial.readBytes((uint8_t*)&manualMPP, sizeof(manualMPP));
+		SetMPPVoltage(manualMPP);
+  	break;
   case SET_MPP_AUTO:
     manualMPP = 0;
     break;
@@ -98,17 +104,20 @@ void updateState() {
   static uint32_t lastPower = 0;
 	sdata.vin_cv = (uint32_t)analogRead(PIN_VIN) * 199 / 44;
 	sdata.vout_dv = (uint16_t)analogRead(PIN_VOUT) * 39 / 38;
-	sdata.iout_ca = (uint16_t)(analogRead(PIN_IOUT) + 2) * 14 / 9;
+	sdata.iout_ca = (uint16_t)analogRead(PIN_IOUT) * 8 / 5;
+  if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
   uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
 	sdata.pout_dw = pout_mw / 100;
 
   if(manualMPP) {
-    if(dacValue != VoltageToDAC(manualMPP)) SetMPPVoltage(manualMPP);
-  } else {
+    SetMPPVoltage(manualMPP);
+  } else if(pout_mw > 5000) {
     if(pout_mw < lastPower) nudge = !nudge;
     bool saturated = NudgeMPP(nudge);
     if(saturated) nudge = !nudge;   // Switch direction on saturation
     lastPower = pout_mw;
+  } else {
+    SetMPPVoltage(320);
   }
 
 	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
@@ -119,16 +128,14 @@ void updateState() {
 
 
 enum SerialSeq : uint8_t {
-	MAGIC1, MAGIC2, MAGIC3, MAGIC4, IDENTITY, COMMAND
+	MAGIC1, MAGIC2, IDENTITY, COMMAND
 } serial_state = MAGIC1;
 
 uint8_t updateSerialState(uint8_t byte) {
-  static constexpr const uint8_t cmd_magic[] = {0x4f, 0xc7, 0xb2, 0x9a};
+  static constexpr const uint8_t cmd_magic[] = {0x4f, 0xc7};
   switch(serial_state) {
 		case MAGIC1: return byte == cmd_magic[0] ? MAGIC2 : MAGIC1;
-		case MAGIC2: return byte == cmd_magic[1] ? MAGIC3 : MAGIC1;
-		case MAGIC3: return byte == cmd_magic[2] ? MAGIC4 : MAGIC1;
-		case MAGIC4: return byte == cmd_magic[3] ? IDENTITY : MAGIC1;
+		case MAGIC2: return byte == cmd_magic[1] ? IDENTITY : MAGIC1;
 		case IDENTITY: return byte == EEPROM.read(0) ? COMMAND : MAGIC1;
 		case COMMAND: runCommand((CommandID)byte); return MAGIC1;
 	}
