@@ -8,14 +8,17 @@ enum Pins {
 	PIN_VIN = A1,
 	PIN_VOUT = A2,
 	PIN_IOUT = A3,
-  PIN_TXEN = 2
+  PIN_TXEN = 2,
+  PIN_SHDN = 9
 };
 
 enum CommandID : uint8_t {
 	MAGIC = 0x0,
 	READ_ALL = 0x1,
 	SET_MPP_MANUAL_DV = 0x2,	// Manually set MPP voltage in decivolts
-  SET_MPP_AUTO = 0x3
+  SET_MPP_AUTO = 0x3,
+  ENABLE_OUTPUT = 0x4,
+  DISABLE_OUTPUT = 0x5,
 };
 
 struct SerialData {
@@ -29,12 +32,14 @@ SerialData sdata;
 uint32_t eout_mj = 0;
 
 MCP4716 dac;
-static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
+//static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) {
   return (mppv_dv * 17) / 10 + 196;
 }
 uint16_t dacValue = VoltageToDAC(320);  // 32V default MPP voltage
 uint16_t manualMPP = 0; // 0 for automatic
+
+bool manualDisableOutput = false;
 
 void SetMPPVoltage(uint16_t mppv_dv) {
   auto newDACValue = VoltageToDAC(mppv_dv);
@@ -43,7 +48,7 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 	dac.SetValue(dacValue);
 }
 
-bool NudgeMPP(bool increase) {
+/*bool NudgeMPP(bool increase) {
   dacValue += increase * 2 - 1;
   bool saturated = true;
   if(dacValue < dacMin) dacValue = dacMin;
@@ -51,6 +56,13 @@ bool NudgeMPP(bool increase) {
   else saturated = false;
   dac.SetValue(dacValue);
   return saturated;
+}*/
+
+void EnableOutput() {
+  digitalWrite(PIN_SHDN, HIGH);
+}
+void DisableOutput() {
+  digitalWrite(PIN_SHDN, LOW);
 }
 
 void setup() {
@@ -62,6 +74,9 @@ void setup() {
 
   pinMode(PIN_TXEN, OUTPUT);
   digitalWrite(PIN_TXEN, LOW);
+
+  pinMode(PIN_SHDN, OUTPUT);
+  digitalWrite(PIN_SHDN, LOW);
 
 	setupLCD();
 
@@ -75,8 +90,6 @@ void SendRS485(uint8_t* data, size_t len) {
   Serial.flush();
   digitalWrite(PIN_TXEN, LOW);
 }
-
-constexpr unsigned long stateUpdatePeriod = 1000ul;
 
 void runCommand(CommandID command) {
 	switch(command) {
@@ -95,7 +108,41 @@ void runCommand(CommandID command) {
   case SET_MPP_AUTO:
     manualMPP = 0;
     break;
+  case ENABLE_OUTPUT:
+    manualDisableOutput = false;
+    break;
+  case DISABLE_OUTPUT:
+    manualDisableOutput = true;
+    DisableOutput();
+    break;
 	}
+}
+
+bool isSleeping = true;
+unsigned long lastOutputEnableCheck = 0, lastSleepSwitch = 0;
+static constexpr const unsigned long wakeDelay_ms = 5000;
+void checkEnableOutput() {
+  if(manualDisableOutput) return;
+  auto vin_cnt = analogRead(PIN_VIN), iout_cnt = analogRead(PIN_IOUT);
+  unsigned long now = millis();
+  if(vin_cnt > 995 || vin_cnt < 550) { // Input over-voltage (>45 V) or under-voltage (<25 V)
+    DisableOutput();
+  } else {
+    if(iout_cnt == 0) {
+      if(isSleeping) {
+        if(now - lastSleepSwitch > wakeDelay_ms) {
+          isSleeping = false;
+          lastSleepSwitch = now;
+          EnableOutput();
+        }
+      } else {
+        isSleeping = true;
+        lastSleepSwitch = now;
+        DisableOutput();
+      }
+    }
+  }
+  lastOutputEnableCheck = now;
 }
 
 unsigned long lastStateUpdate = 0;
@@ -111,11 +158,11 @@ void updateState() {
 
   if(manualMPP) {
     SetMPPVoltage(manualMPP);
-  } else if(pout_mw > 5000) {
-    if(pout_mw < lastPower) nudge = !nudge;
-    bool saturated = NudgeMPP(nudge);
-    if(saturated) nudge = !nudge;   // Switch direction on saturation
-    lastPower = pout_mw;
+//  } else if(pout_mw > 5000) {
+//    if(pout_mw < lastPower) nudge = !nudge;
+//    bool saturated = NudgeMPP(nudge);
+//    if(saturated) nudge = !nudge;   // Switch direction on saturation
+//    lastPower = pout_mw;
   } else {
     SetMPPVoltage(320);
   }
@@ -141,8 +188,10 @@ uint8_t updateSerialState(uint8_t byte) {
 	}
 }
 
-
+static constexpr const unsigned long outputEnableCheckPeriod = 100ul;
+static constexpr const unsigned long stateUpdatePeriod = 1000ul;
 void loop() {
+	if(millis() - lastOutputEnableCheck > outputEnableCheckPeriod) checkEnableOutput();
 	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
 
   while(Serial.available()) {
