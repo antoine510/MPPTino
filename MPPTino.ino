@@ -8,7 +8,9 @@
 
 static constexpr uint8_t MAGIC_NUMBER = 0x42;
 static constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
+static constexpr unsigned long outputEnableCheckPeriod = 250ul;
 static constexpr unsigned long stateUpdatePeriod = 1000ul;
+static constexpr unsigned long wakePeriod = 10000ul;
 
 enum Pins {
   PIN_VIN = A1,
@@ -22,7 +24,9 @@ enum CommandID : uint8_t {
   MAGIC = 0x0,
   READ_ALL = 0x1,
   SET_MPP_MANUAL_DV = 0x2,	// Manually set MPP voltage in decivolts
-  SET_MPP_AUTO = 0x3
+  SET_MPP_AUTO = 0x3,
+  ENABLE_OUTPUT = 0x4,
+  DISABLE_OUTPUT = 0x5
 };
 
 struct SerialData {
@@ -61,7 +65,7 @@ void setup() {
 
   dac.SetValue(dacValue); // Initialize DAC to startup value
 
-  digitalWrite(PIN_EN_LTC3813, HIGH);
+  digitalWrite(PIN_EN_LTC3813, LOW);
   pinMode(PIN_EN_LTC3813, OUTPUT);
 }
 
@@ -73,6 +77,7 @@ void SendRS485(const uint8_t* data, size_t len) {
 }
 
 uint16_t manualMPP = 0; // 0 for automatic
+bool forceDisableOutput = false;
 void runCommand(CommandID command) {
   switch(command) {
   case MAGIC:
@@ -90,9 +95,37 @@ void runCommand(CommandID command) {
   case SET_MPP_AUTO:
     manualMPP = 0;
     break;
+  case ENABLE_OUTPUT:
+    forceDisableOutput = false;
+    break;
+  case DISABLE_OUTPUT:
+    forceDisableOutput = true;
+    digitalWrite(PIN_EN_LTC3813, LOW);
+    break;
   }
 }
 
+bool isSleeping = true;
+unsigned long nextOutputEnableCheck = 0, nextWake = 0;
+void checkEnableOutput() {
+  nextOutputEnableCheck = millis() + outputEnableCheckPeriod;
+
+  if(forceDisableOutput) return;
+  if(analogRead(PIN_IOUT) == 0) {  // No power being produced
+    if(isSleeping) {  // Wake-up if open-circuit voltage recovered and min time has passed
+      if(vinTransform_cV(analogRead(PIN_VIN)) > 3000 && millis() > nextWake) {
+        isSleeping = false;
+        digitalWrite(PIN_EN_LTC3813, HIGH);
+      }
+    } else {  // Go to sleep
+      isSleeping = true;
+      nextWake = millis() + wakePeriod;
+      digitalWrite(PIN_EN_LTC3813, LOW);
+    }
+  }
+}
+
+unsigned long nextStateUpdate = 0;
 void updateState() {
   sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
   sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
@@ -123,7 +156,6 @@ uint8_t updateSerialState(uint8_t byte) {
     case COMMAND: runCommand((CommandID)byte); return MAGIC1;
   }
 }
-
 
 void loop() {
   static unsigned long nextStateUpdate = 0;
