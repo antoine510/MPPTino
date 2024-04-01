@@ -9,7 +9,7 @@ enum Pins {
 	PIN_VOUT = A2,
 	PIN_IOUT = A3,
   PIN_TXEN = 2,
-  PIN_SHDN = 9
+  PIN_SHDN = 9  // PB1
 };
 
 enum CommandID : uint8_t {
@@ -59,13 +59,16 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 }*/
 
 void EnableOutput() {
-  digitalWrite(PIN_SHDN, HIGH);
+  PORTB |= 0x02;
 }
 void DisableOutput() {
-  digitalWrite(PIN_SHDN, LOW);
+  PORTB &= 0xfd;
 }
 
 void setup() {
+  PORTB &= 0xfd;  // Shutdown LTC3813
+  DDRB |= 0x02;
+
 	Serial.begin(9600);
 
 	pinMode(PIN_VIN, INPUT);
@@ -74,9 +77,6 @@ void setup() {
 
   pinMode(PIN_TXEN, OUTPUT);
   digitalWrite(PIN_TXEN, LOW);
-
-  pinMode(PIN_SHDN, OUTPUT);
-  digitalWrite(PIN_SHDN, LOW);
 
 	setupLCD();
 
@@ -125,7 +125,7 @@ void checkEnableOutput() {
   if(manualDisableOutput) return;
   auto vin_cnt = analogRead(PIN_VIN), iout_cnt = analogRead(PIN_IOUT);
   unsigned long now = millis();
-  if(vin_cnt > 995 || vin_cnt < 550) { // Input over-voltage (>45 V) or under-voltage (<25 V)
+  if(vin_cnt > VoltageToDAC(450) || vin_cnt < VoltageToDAC(250)) { // Bad input voltage
     DisableOutput();
   } else {
     if(iout_cnt == 0) {
@@ -147,7 +147,7 @@ void checkEnableOutput() {
 
 unsigned long lastStateUpdate = 0;
 void updateState() {
-  static bool nudge = true;
+//  static bool nudge = true;
   static uint32_t lastPower = 0;
 	sdata.vin_cv = (uint32_t)analogRead(PIN_VIN) * 199 / 44;
 	sdata.vout_dv = (uint16_t)analogRead(PIN_VOUT) * 39 / 38;
@@ -188,7 +188,7 @@ uint8_t updateSerialState(uint8_t byte) {
 	}
 }
 
-static constexpr const unsigned long outputEnableCheckPeriod = 100ul;
+static constexpr const unsigned long outputEnableCheckPeriod = 250ul;
 static constexpr const unsigned long stateUpdatePeriod = 1000ul;
 void loop() {
 	if(millis() - lastOutputEnableCheck > outputEnableCheckPeriod) checkEnableOutput();
