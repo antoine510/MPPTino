@@ -1,8 +1,15 @@
 #include <EEPROM.h>
-#include <ST7565.h>
 #include <MCP4716.h>
 
+#define USE_LCD 0
+#if USE_LCD
+#include <ST7565.h>
+#endif
+
 static constexpr const uint8_t MAGIC_NUMBER = 0x42;
+
+static constexpr const unsigned long wakeDelay_ms = 10000;
+static constexpr const uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
 
 enum Pins {
 	PIN_VIN = A1,
@@ -33,13 +40,12 @@ uint32_t eout_mj = 0;
 
 MCP4716 dac;
 //static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
-constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) {
-  return (mppv_dv * 17) / 10 + 196;
-}
-uint16_t dacValue = VoltageToDAC(320);  // 32V default MPP voltage
-uint16_t manualMPP = 0; // 0 for automatic
+constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv * 17) / 10 + 196; }
+uint16_t dacValue = VoltageToDAC(mppVoltage_dV);
 
-bool manualDisableOutput = false;
+constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
+constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
+constexpr uint16_t ioutTransform_cA(uint16_t count) { return count * 8 / 5; }
 
 void SetMPPVoltage(uint16_t mppv_dv) {
   auto newDACValue = VoltageToDAC(mppv_dv);
@@ -78,7 +84,9 @@ void setup() {
   pinMode(PIN_TXEN, OUTPUT);
   digitalWrite(PIN_TXEN, LOW);
 
+#if USE_LCD
 	setupLCD();
+#endif
 
 	dac.SetValue(dacValue); // Initialize DAC to startup value
 }
@@ -91,6 +99,8 @@ void SendRS485(uint8_t* data, size_t len) {
   digitalWrite(PIN_TXEN, LOW);
 }
 
+bool manualDisableOutput = false;
+uint16_t manualMPP = 0; // 0 for automatic
 void runCommand(CommandID command) {
 	switch(command) {
   case MAGIC:
@@ -119,27 +129,23 @@ void runCommand(CommandID command) {
 }
 
 bool isSleeping = true;
-unsigned long lastOutputEnableCheck = 0, lastSleepSwitch = 0;
-static constexpr const unsigned long wakeDelay_ms = 5000;
+unsigned long lastOutputEnableCheck = 0, lastSleep = 0;
 void checkEnableOutput() {
   if(manualDisableOutput) return;
-  auto vin_cnt = analogRead(PIN_VIN), iout_cnt = analogRead(PIN_IOUT);
-  unsigned long now = millis();
-  if(vin_cnt > VoltageToDAC(450) || vin_cnt < VoltageToDAC(250)) { // Bad input voltage
+  auto vin_cV = vinTransform_cV(analogRead(PIN_VIN));
+  auto now = millis();
+  if(vin_cV > 4500) { // Dangerous input voltage
     DisableOutput();
-  } else {
-    if(iout_cnt == 0) {
-      if(isSleeping) {
-        if(now - lastSleepSwitch > wakeDelay_ms) {
-          isSleeping = false;
-          lastSleepSwitch = now;
-          EnableOutput();
-        }
-      } else {
-        isSleeping = true;
-        lastSleepSwitch = now;
-        DisableOutput();
+  } else if(analogRead(PIN_IOUT) == 0) {  // No power being produced
+    if(isSleeping) {  // Wake-up if open-circuit voltage recovered and min time has passed
+      if(vin_cV > 3000 && now - lastSleep > wakeDelay_ms) {
+        isSleeping = false;
+        EnableOutput();
       }
+    } else {  // Go to sleep
+      isSleeping = true;
+      lastSleep = now;
+      DisableOutput();
     }
   }
   lastOutputEnableCheck = now;
@@ -148,10 +154,10 @@ void checkEnableOutput() {
 unsigned long lastStateUpdate = 0;
 void updateState() {
 //  static bool nudge = true;
-  static uint32_t lastPower = 0;
-	sdata.vin_cv = (uint32_t)analogRead(PIN_VIN) * 199 / 44;
-	sdata.vout_dv = (uint16_t)analogRead(PIN_VOUT) * 39 / 38;
-	sdata.iout_ca = (uint16_t)analogRead(PIN_IOUT) * 8 / 5;
+//  static uint32_t lastPower = 0;
+	sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
+	sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
+	sdata.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
   if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
   uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
 	sdata.pout_dw = pout_mw / 100;
@@ -164,13 +170,15 @@ void updateState() {
 //    if(saturated) nudge = !nudge;   // Switch direction on saturation
 //    lastPower = pout_mw;
   } else {
-    SetMPPVoltage(320);
+    SetMPPVoltage(mppVoltage_dV);
   }
 
 	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
 	lastStateUpdate = millis();
 
+#if USE_LCD
 	updateLCD();
+#endif
 }
 
 
@@ -199,6 +207,7 @@ void loop() {
 	}
 }
 
+#if USE_LCD
 void setupLCD() {
   ST7565::begin(0x03);
 	ST7565::clear();
@@ -242,3 +251,4 @@ void updateLCD() {
 
 	ST7565::display();
 }
+#endif
