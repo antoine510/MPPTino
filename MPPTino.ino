@@ -1,15 +1,14 @@
 #include <EEPROM.h>
 #include <MCP4716.h>
 
-#define USE_LCD 0
+#define USE_LCD 1
 #if USE_LCD
 #include <ST7565.h>
 #endif
 
 static constexpr const uint8_t MAGIC_NUMBER = 0x42;
-
-static constexpr const unsigned long wakeDelay_ms = 10000;
 static constexpr const uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
+static constexpr const unsigned long stateUpdatePeriod = 1000ul;
 
 enum Pins {
 	PIN_VIN = A1,
@@ -23,9 +22,7 @@ enum CommandID : uint8_t {
 	MAGIC = 0x0,
 	READ_ALL = 0x1,
 	SET_MPP_MANUAL_DV = 0x2,	// Manually set MPP voltage in decivolts
-  SET_MPP_AUTO = 0x3,
-  ENABLE_OUTPUT = 0x4,
-  DISABLE_OUTPUT = 0x5,
+  SET_MPP_AUTO = 0x3
 };
 
 struct SerialData {
@@ -36,7 +33,7 @@ struct SerialData {
 	uint16_t eout_j;
 };
 SerialData sdata;
-uint32_t eout_mj = 0;
+uint32_t eout_dj = 0;
 
 MCP4716 dac;
 //static constexpr const uint16_t dacMin = 672, dacMax = 791; // 28V - 35V
@@ -64,15 +61,8 @@ void SetMPPVoltage(uint16_t mppv_dv) {
   return saturated;
 }*/
 
-void EnableOutput() {
-  PORTB |= 0x02;
-}
-void DisableOutput() {
-  PORTB &= 0xfd;
-}
-
 void setup() {
-  PORTB &= 0xfd;  // Shutdown LTC3813
+  PORTB |= 0x02;  // Enable LTC3813
   DDRB |= 0x02;
 
 	Serial.begin(9600);
@@ -107,8 +97,8 @@ void runCommand(CommandID command) {
     SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER));
     break;
 	case READ_ALL:
-		sdata.eout_j = eout_mj / 1000;
-		eout_mj = 0;
+		sdata.eout_j = eout_dj / 10;
+		eout_dj = 0;
     SendRS485((uint8_t*)(&sdata), sizeof(SerialData));
 		break;
 	case SET_MPP_MANUAL_DV:
@@ -118,41 +108,12 @@ void runCommand(CommandID command) {
   case SET_MPP_AUTO:
     manualMPP = 0;
     break;
-  case ENABLE_OUTPUT:
-    manualDisableOutput = false;
-    break;
-  case DISABLE_OUTPUT:
-    manualDisableOutput = true;
-    DisableOutput();
-    break;
 	}
 }
 
-bool isSleeping = true;
-unsigned long lastOutputEnableCheck = 0, lastSleep = 0;
-void checkEnableOutput() {
-  if(manualDisableOutput) return;
-  auto vin_cV = vinTransform_cV(analogRead(PIN_VIN));
-  auto now = millis();
-  if(vin_cV > 4500) { // Dangerous input voltage
-    DisableOutput();
-  } else if(analogRead(PIN_IOUT) == 0) {  // No power being produced
-    if(isSleeping) {  // Wake-up if open-circuit voltage recovered and min time has passed
-      if(vin_cV > 3000 && now - lastSleep > wakeDelay_ms) {
-        isSleeping = false;
-        EnableOutput();
-      }
-    } else {  // Go to sleep
-      isSleeping = true;
-      lastSleep = now;
-      DisableOutput();
-    }
-  }
-  lastOutputEnableCheck = now;
-}
-
-unsigned long lastStateUpdate = 0;
+unsigned long nextStateUpdate = 0;
 void updateState() {
+  nextStateUpdate = millis() + stateUpdatePeriod;
 //  static bool nudge = true;
 //  static uint32_t lastPower = 0;
 	sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
@@ -173,8 +134,7 @@ void updateState() {
     SetMPPVoltage(mppVoltage_dV);
   }
 
-	eout_mj += (uint32_t)sdata.pout_dw * (millis() - lastStateUpdate) / 10;
-	lastStateUpdate = millis();
+	eout_dj += (uint32_t)sdata.pout_dw;
 
 #if USE_LCD
 	updateLCD();
@@ -196,11 +156,9 @@ uint8_t updateSerialState(uint8_t byte) {
 	}
 }
 
-static constexpr const unsigned long outputEnableCheckPeriod = 250ul;
-static constexpr const unsigned long stateUpdatePeriod = 1000ul;
+
 void loop() {
-	if(millis() - lastOutputEnableCheck > outputEnableCheckPeriod) checkEnableOutput();
-	if(millis() - lastStateUpdate > stateUpdatePeriod) updateState();
+	if(millis() > nextStateUpdate) updateState();
 
   while(Serial.available()) {
     serial_state = (SerialSeq)updateSerialState(Serial.read());
