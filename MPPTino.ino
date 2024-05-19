@@ -161,7 +161,7 @@ void checkSleep() {
 }
 
 void updateState() {
-  static bool increaseMPPV = true;
+  static bool increaseMPPV = true, blinkOn = false;
   static uint32_t lastPout_mw = 0;
 
   sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
@@ -179,6 +179,8 @@ void updateState() {
       bool saturated = NudgeMPP(increaseMPPV);
       if(saturated || pout_mw < lastPout_mw) increaseMPPV = !increaseMPPV;
       lastPout_mw = pout_mw;
+      digitalWrite(PIN_LED, blinkOn);
+      blinkOn = !blinkOn;
     }
   } else SetMPPVoltage(mppVoltage_dV);
 
