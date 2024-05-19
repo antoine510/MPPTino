@@ -9,6 +9,8 @@
 constexpr uint8_t MAGIC_NUMBER = 0x42;
 constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
 constexpr uint16_t minWakeVoltage_cV = 2800;
+constexpr uint32_t minPowerMPPT_mw = 5000ul;
+constexpr uint16_t maxVoltageDeltaMPP_cv = 50;
 constexpr unsigned long stateUpdatePeriod = 1000ul;
 constexpr unsigned long sleepCheckPeriod = 5000ul;
 constexpr unsigned long wakeupMaxDuration = 1000ul;
@@ -42,8 +44,11 @@ SerialData sdata;
 uint32_t eout_mj = 0;
 
 MCP4716 dac;
-constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv * 17) / 10 + 196; }
+constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return mppv_dv * 17 / 10 + 196; }
+constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return (dacVal - 196) * 10 / 17; }
 uint16_t dacValue = VoltageToDAC(mppVoltage_dV);
+
+constexpr uint16_t dacMin = VoltageToDAC(280), dacMax = VoltageToDAC(340);
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
@@ -54,6 +59,16 @@ void SetMPPVoltage(uint16_t mppv_dv) {
   if(newDACValue == dacValue) return;
   dacValue = newDACValue;
   dac.SetValue(dacValue);
+}
+
+bool NudgeMPP(bool increase) {
+  if(increase) ++dacValue; else dacValue--;
+  bool saturated = true;
+  if(dacValue < dacMin) dacValue = dacMin;
+  else if(dacValue > dacMax) dacValue = dacMax;
+  else saturated = false;
+  dac.SetValue(dacValue);
+  return saturated;
 }
 
 bool isSleeping = true;
@@ -146,15 +161,26 @@ void checkSleep() {
 }
 
 void updateState() {
+  static bool increaseMPPV = true;
+  static uint32_t lastPout_mw = 0;
+
   sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
   sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
   sdata.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
   if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
 
   static_assert(stateUpdatePeriod == 1000ul);
-  eout_mj += (uint32_t)sdata.vout_dv * sdata.iout_ca;
+  uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
+  eout_mj += pout_mw;
 
-  SetMPPVoltage(manualMPP ? manualMPP : mppVoltage_dV);
+  if(manualMPP) SetMPPVoltage(manualMPP);
+  else if(pout_mw > minPowerMPPT_mw) {
+    if(abs(sdata.vin_cv - DACToVoltage_dv(dacValue) * 10) < maxVoltageDeltaMPP_cv) {  // Input voltage is linked to DAC setting
+      bool saturated = NudgeMPP(increaseMPPV);
+      if(saturated || pout_mw < lastPout_mw) increaseMPPV = !increaseMPPV;
+      lastPout_mw = pout_mw;
+    }
+  } else SetMPPVoltage(mppVoltage_dV);
 
 #if USE_LCD
   updateLCD();
