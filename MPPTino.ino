@@ -19,7 +19,8 @@ enum Pins {
   PIN_IOUT = A3,
   PIN_TXEN = 2,       // PD2
   PIN_EN_LTC3813 = 3, // PD3
-  PIN_EN_TOP_MOS = 4  // PD4
+  PIN_EN_TOP_MOS = 4, // PD4
+  PIN_LED = 13
 };
 
 enum CommandID : uint8_t {
@@ -59,6 +60,7 @@ bool isSleeping = true;
 void goToSleep() {
   digitalWrite(PIN_EN_TOP_MOS, LOW);
   digitalWrite(PIN_EN_LTC3813, LOW);
+  digitalWrite(PIN_LED, LOW);
   isSleeping = true;
 }
 
@@ -68,6 +70,7 @@ void wakeup() {
   while(millis() < stopTrying) {
     if(analogRead(PIN_IOUT) > 10) {
       digitalWrite(PIN_EN_TOP_MOS, HIGH); // Positive power, enable synchronous rectification
+      digitalWrite(PIN_LED, HIGH);
       isSleeping = false;
       return;
     }
@@ -80,6 +83,9 @@ void setup() {
 
   digitalWrite(PIN_TXEN, LOW);
   pinMode(PIN_TXEN, OUTPUT);
+
+  digitalWrite(PIN_LED, HIGH);
+  pinMode(PIN_LED, OUTPUT);
 
 #if USE_LCD
   setupLCD();
