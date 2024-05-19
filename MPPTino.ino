@@ -6,18 +6,20 @@
 #include <ST7565.h>
 #endif
 
-static constexpr uint8_t MAGIC_NUMBER = 0x42;
-static constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
-static constexpr unsigned long outputEnableCheckPeriod = 250ul;
-static constexpr unsigned long stateUpdatePeriod = 1000ul;
-static constexpr unsigned long wakePeriod = 10000ul;
+constexpr uint8_t MAGIC_NUMBER = 0x42;
+constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
+constexpr uint16_t minWakeVoltage_cV = 2800;
+constexpr unsigned long stateUpdatePeriod = 1000ul;
+constexpr unsigned long sleepCheckPeriod = 5000ul;
+constexpr unsigned long wakeupMaxDuration = 1000ul;
 
 enum Pins {
   PIN_VIN = A1,
   PIN_VOUT = A2,
   PIN_IOUT = A3,
   PIN_TXEN = 2,       // PD2
-  PIN_EN_LTC3813 = 9  // PB1
+  PIN_EN_LTC3813 = 3, // PD3
+  PIN_EN_TOP_MOS = 4  // PD4
 };
 
 enum CommandID : uint8_t {
@@ -53,6 +55,26 @@ void SetMPPVoltage(uint16_t mppv_dv) {
   dac.SetValue(dacValue);
 }
 
+bool isSleeping = true;
+void goToSleep() {
+  digitalWrite(PIN_EN_TOP_MOS, LOW);
+  digitalWrite(PIN_EN_LTC3813, LOW);
+  isSleeping = true;
+}
+
+void wakeup() {
+  digitalWrite(PIN_EN_LTC3813, HIGH);
+  unsigned long stopTrying = millis() + wakeupMaxDuration;
+  while(millis() < stopTrying) {
+    if(analogRead(PIN_IOUT) > 10) {
+      digitalWrite(PIN_EN_TOP_MOS, HIGH); // Positive power, enable synchronous rectification
+      isSleeping = false;
+      return;
+    }
+  }
+  digitalWrite(PIN_EN_LTC3813, LOW);  // Wakeup failed
+}
+
 void setup() {
   Serial.begin(9600);
 
@@ -65,8 +87,9 @@ void setup() {
 
   dac.SetValue(dacValue); // Initialize DAC to startup value
 
-  digitalWrite(PIN_EN_LTC3813, LOW);
+  goToSleep();
   pinMode(PIN_EN_LTC3813, OUTPUT);
+  pinMode(PIN_EN_TOP_MOS, OUTPUT);
 }
 
 void SendRS485(const uint8_t* data, size_t len) {
@@ -100,32 +123,22 @@ void runCommand(CommandID command) {
     break;
   case DISABLE_OUTPUT:
     forceDisableOutput = true;
-    digitalWrite(PIN_EN_LTC3813, LOW);
+    goToSleep();
     break;
   }
 }
 
-bool isSleeping = true;
-unsigned long nextOutputEnableCheck = 0, nextWake = 0;
-void checkEnableOutput() {
-  nextOutputEnableCheck = millis() + outputEnableCheckPeriod;
 
-  if(forceDisableOutput) return;
-  if(analogRead(PIN_IOUT) == 0) {  // No power being produced
-    if(isSleeping) {  // Wake-up if open-circuit voltage recovered and min time has passed
-      if(vinTransform_cV(analogRead(PIN_VIN)) > 3000 && millis() > nextWake) {
-        isSleeping = false;
-        digitalWrite(PIN_EN_LTC3813, HIGH);
-      }
-    } else {  // Go to sleep
-      isSleeping = true;
-      nextWake = millis() + wakePeriod;
-      digitalWrite(PIN_EN_LTC3813, LOW);
-    }
+unsigned long nextWake = 0;
+void checkSleep() {
+  if(forceDisableOutput || analogRead(PIN_IOUT) != 0) return; // Power being produced
+  if(isSleeping) {
+    if(vinTransform_cV(analogRead(PIN_VIN)) > minWakeVoltage_cV) wakeup();
+  } else {
+    goToSleep();
   }
 }
 
-unsigned long nextStateUpdate = 0;
 void updateState() {
   sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
   sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
@@ -158,11 +171,15 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 void loop() {
-  static unsigned long nextStateUpdate = 0;
+  static unsigned long nextStateUpdate = 0, nextSleepCheck = 0;
   if(millis() > nextStateUpdate) {
     nextStateUpdate += stateUpdatePeriod;
     updateState();
-  } 
+  }
+  if(millis() > nextSleepCheck) {
+    nextSleepCheck += sleepCheckPeriod;
+    checkSleep();
+  }
 
   while(Serial.available()) {
     serial_state = (SerialSeq)updateSerialState(Serial.read());
