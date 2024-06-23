@@ -1,5 +1,6 @@
 #include <EEPROM.h>
 #include <MCP4716.h>
+#include <OneWire.h>	// For DS18B20
 
 #define USE_LCD 1
 #if USE_LCD
@@ -7,21 +8,18 @@
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
-constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
-constexpr uint16_t minWakeVoltage_cV = 2800;
-constexpr uint32_t minPowerMPPT_mw = 5000ul;
-constexpr uint16_t maxVoltageDeltaMPP_cv = 50;
-constexpr unsigned long stateUpdatePeriod = 1000ul;
-constexpr unsigned long sleepCheckPeriod = 5000ul;
-constexpr unsigned long wakeupMaxDuration = 1000ul;
+constexpr uint16_t mppVoltage_dV = 300;  // 32V default MPP voltage
+constexpr uint32_t minPowerMPPT_mw = 5000;
+constexpr uint16_t maxVoltageDeltaMPP_cv = 100;
+constexpr unsigned long stateUpdatePeriod = 1000;
+constexpr int8_t maxTemperature = 100;
 
 enum Pins {
   PIN_VIN = A1,
   PIN_VOUT = A2,
   PIN_IOUT = A3,
-  PIN_TXEN = 2,       // PD2
-  PIN_EN_LTC3813 = 3, // PD3
-  PIN_EN_TOP_MOS = 4, // PD4
+  PIN_TXEN = 2,         // PD2
+  PIN_TEMPERATURE = 10, // PB2
   PIN_LED = 13
 };
 
@@ -29,9 +27,7 @@ enum CommandID : uint8_t {
   MAGIC = 0x0,
   READ_ALL = 0x1,
   SET_MPP_MANUAL_DV = 0x2,	// Manually set MPP voltage in decivolts
-  SET_MPP_AUTO = 0x3,
-  ENABLE_OUTPUT = 0x4,
-  DISABLE_OUTPUT = 0x5
+  SET_MPP_AUTO = 0x3
 };
 
 struct SerialData {
@@ -39,16 +35,15 @@ struct SerialData {
   uint16_t vout_dv;
   uint16_t iout_ca;
   uint16_t eout_j;
+  uint8_t temp_c;
 };
 SerialData sdata;
 uint32_t eout_mj = 0;
 
 MCP4716 dac;
-constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return mppv_dv * 17 / 10 + 196; }
-constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return (dacVal - 196) * 10 / 17; }
+constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 255) * 350 / 47; }
+constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return dacVal * 47 / 350 + 255; }
 uint16_t dacValue = VoltageToDAC(mppVoltage_dV);
-
-constexpr uint16_t dacMin = VoltageToDAC(280), dacMax = VoltageToDAC(340);
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
@@ -62,35 +57,30 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 }
 
 bool NudgeMPP(bool increase) {
-  if(increase) ++dacValue; else dacValue--;
-  bool saturated = true;
-  if(dacValue < dacMin) dacValue = dacMin;
-  else if(dacValue > dacMax) dacValue = dacMax;
-  else saturated = false;
-  dac.SetValue(dacValue);
-  return saturated;
-}
-
-bool isSleeping = true;
-void goToSleep() {
-  digitalWrite(PIN_EN_TOP_MOS, LOW);
-  digitalWrite(PIN_EN_LTC3813, LOW);
-  digitalWrite(PIN_LED, LOW);
-  isSleeping = true;
-}
-
-void wakeup() {
-  digitalWrite(PIN_EN_LTC3813, HIGH);
-  unsigned long stopTrying = millis() + wakeupMaxDuration;
-  while(millis() < stopTrying) {
-    if(analogRead(PIN_IOUT) > 10) {
-      digitalWrite(PIN_EN_TOP_MOS, HIGH); // Positive power, enable synchronous rectification
-      digitalWrite(PIN_LED, HIGH);
-      isSleeping = false;
-      return;
-    }
+  if(increase) {
+    if(dacValue < 1023) ++dacValue;
+    else return true;
+  } else {
+    if(dacValue > 0) dacValue--;
+    else return true;
   }
-  digitalWrite(PIN_EN_LTC3813, LOW);  // Wakeup failed
+  dac.SetValue(dacValue);
+  return false;
+}
+
+int8_t GetTemperature() {
+  static OneWire tsens(PIN_TEMPERATURE);
+
+	tsens.reset();
+	tsens.skip();
+	tsens.write(0xbe);
+	byte l = tsens.read(), h = tsens.read();
+	int8_t res = (int16_t)(l | (h << 8)) >> 4;
+
+	tsens.reset();
+	tsens.skip();
+	tsens.write(0x44);	// Start next measurement
+	return res;
 }
 
 void setup() {
@@ -107,10 +97,6 @@ void setup() {
 #endif
 
   dac.SetValue(dacValue); // Initialize DAC to startup value
-
-  goToSleep();
-  pinMode(PIN_EN_LTC3813, OUTPUT);
-  pinMode(PIN_EN_TOP_MOS, OUTPUT);
 }
 
 void SendRS485(const uint8_t* data, size_t len) {
@@ -139,24 +125,6 @@ void runCommand(CommandID command) {
   case SET_MPP_AUTO:
     manualMPP = 0;
     break;
-  case ENABLE_OUTPUT:
-    forceDisableOutput = false;
-    break;
-  case DISABLE_OUTPUT:
-    forceDisableOutput = true;
-    goToSleep();
-    break;
-  }
-}
-
-
-unsigned long nextWake = 0;
-void checkSleep() {
-  if(forceDisableOutput || analogRead(PIN_IOUT) != 0) return; // Power being produced
-  if(isSleeping) {
-    if(vinTransform_cV(analogRead(PIN_VIN)) > minWakeVoltage_cV) wakeup();
-  } else {
-    goToSleep();
   }
 }
 
@@ -173,16 +141,23 @@ void updateState() {
   uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
   eout_mj += pout_mw;
 
-  if(manualMPP) SetMPPVoltage(manualMPP);
-  else if(pout_mw > minPowerMPPT_mw) {
-    if(abs(sdata.vin_cv - DACToVoltage_dv(dacValue) * 10) < maxVoltageDeltaMPP_cv) {  // Input voltage is linked to DAC setting
-      bool saturated = NudgeMPP(increaseMPPV);
-      if(saturated || pout_mw < lastPout_mw) increaseMPPV = !increaseMPPV;
-      lastPout_mw = pout_mw;
-      digitalWrite(PIN_LED, blinkOn);
-      blinkOn = !blinkOn;
-    }
-  } else SetMPPVoltage(mppVoltage_dV);
+  sdata.temp_c = GetTemperature();
+  if(sdata.temp_c > maxTemperature) {
+    NudgeMPP(true);
+    increaseMPPV = false;
+    lastPout_mw = 0;
+  } else {
+    if(manualMPP) SetMPPVoltage(manualMPP);
+    else if(pout_mw > minPowerMPPT_mw) {
+      if(abs(sdata.vin_cv - DACToVoltage_dv(dacValue) * 10) < maxVoltageDeltaMPP_cv) {  // Input voltage is linked to DAC setting
+        bool saturated = NudgeMPP(increaseMPPV);
+        if(saturated || pout_mw < lastPout_mw) increaseMPPV = !increaseMPPV;
+        lastPout_mw = pout_mw;
+        digitalWrite(PIN_LED, blinkOn);
+        blinkOn = !blinkOn;
+      }
+    } else SetMPPVoltage(mppVoltage_dV);
+  }
 
 #if USE_LCD
   updateLCD();
@@ -205,14 +180,10 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 void loop() {
-  static unsigned long nextStateUpdate = 0, nextSleepCheck = 0;
+  static unsigned long nextStateUpdate = 0;
   if(millis() > nextStateUpdate) {
     nextStateUpdate += stateUpdatePeriod;
     updateState();
-  }
-  if(millis() > nextSleepCheck) {
-    nextSleepCheck += sleepCheckPeriod;
-    checkSleep();
   }
 
   while(Serial.available()) {
@@ -227,6 +198,8 @@ void setupLCD() {
 
   ST7565::drawchar_aligned(2, 0, '.');
   ST7565::drawchar_aligned(4, 0, 'V');
+
+  ST7565::drawchar_aligned(8, 0, 'C');
 
   ST7565::drawchar_aligned(2, 2, '.');
   ST7565::drawchar_aligned(4, 2, 'V');
@@ -244,6 +217,11 @@ void updateLCD() {
   ST7565::drawchar_aligned(1, 0, vin % 10 + 48);
   vin /= 10;
   ST7565::drawchar_aligned(0, 0, vin ? vin + 48 : 0);
+
+  auto temp = sdata.temp_c;
+  ST7565::drawchar_aligned(7, 0, temp % 10 + 48);
+  temp /= 10;
+  ST7565::drawchar_aligned(6, 0, temp ? temp + 48 : 0);
 
   auto vout = sdata.vout_dv;
   ST7565::drawchar_aligned(3, 2, vout % 10 + 48);
