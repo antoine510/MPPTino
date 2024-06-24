@@ -8,10 +8,11 @@
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
-constexpr uint16_t mppVoltage_dV = 300;  // 32V default MPP voltage
+constexpr uint16_t mppVoltage_dV = 320;  // 32V default MPP voltage
 constexpr uint32_t minPowerMPPT_mw = 5000;
 constexpr uint16_t maxVoltageDeltaMPP_cv = 100;
-constexpr unsigned long stateUpdatePeriod = 1000;
+constexpr unsigned long stateUpdatePeriod = 500;
+constexpr unsigned long energyUpdatePeriod = 1000;
 constexpr int8_t maxTemperature = 100;
 
 enum Pins {
@@ -83,6 +84,40 @@ int8_t GetTemperature() {
 	return res;
 }
 
+void readSensors() {
+  sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
+  sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
+  sdata.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
+  if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
+  sdata.temp_c = GetTemperature();
+}
+
+void updateEnergy() {
+  static_assert(energyUpdatePeriod == 1000ul);
+  eout_mj += (uint32_t)sdata.vout_dv * sdata.iout_ca;
+}
+
+class PowerTrendEstimator {
+public:
+  void update() {
+    uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
+
+    avgPout_mw = (pout_mw + avgSamples * avgPout_mw + ((avgSamples + 1) / 2)) / (avgSamples + 1);
+    recentPout_mw = (pout_mw + recentSamples * recentPout_mw + ((recentSamples + 1) / 2)) / (recentSamples + 1);
+  }
+
+  bool decreasing() {
+    bool res = (avgPout_mw - recentPout_mw) > powerDecreaseThreshold_mw;
+    if(res) recentPout_mw = avgPout_mw;
+    return res;
+  }
+
+  static constexpr uint32_t powerDecreaseThreshold_mw = 5000;
+  static constexpr uint8_t avgSamples = 15, recentSamples = 7;
+  uint32_t avgPout_mw = 0, recentPout_mw = 0;
+};
+PowerTrendEstimator powerTrend;
+
 void setup() {
   Serial.begin(9600);
 
@@ -130,29 +165,19 @@ void runCommand(CommandID command) {
 
 void updateState() {
   static bool increaseMPPV = true, blinkOn = false;
-  static uint32_t lastPout_mw = 0;
 
-  sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
-  sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
-  sdata.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
-  if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
+  readSensors();
 
-  static_assert(stateUpdatePeriod == 1000ul);
-  uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
-  eout_mj += pout_mw;
+  powerTrend.update();
 
-  sdata.temp_c = GetTemperature();
   if(sdata.temp_c > maxTemperature) {
     NudgeMPP(true);
-    increaseMPPV = false;
-    lastPout_mw = 0;
   } else {
     if(manualMPP) SetMPPVoltage(manualMPP);
-    else if(pout_mw > minPowerMPPT_mw) {
+    else if(powerTrend.avgPout_mw > minPowerMPPT_mw) {
       if(abs(sdata.vin_cv - DACToVoltage_dv(dacValue) * 10) < maxVoltageDeltaMPP_cv) {  // Input voltage is linked to DAC setting
         bool saturated = NudgeMPP(increaseMPPV);
-        if(saturated || pout_mw < lastPout_mw) increaseMPPV = !increaseMPPV;
-        lastPout_mw = pout_mw;
+        if(saturated || powerTrend.decreasing()) increaseMPPV = !increaseMPPV;
         digitalWrite(PIN_LED, blinkOn);
         blinkOn = !blinkOn;
       }
@@ -180,10 +205,15 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 void loop() {
-  static unsigned long nextStateUpdate = 0;
-  if(millis() > nextStateUpdate) {
+  static unsigned long nextStateUpdate = 0, nextEnergyUpdate;
+  auto now = millis();
+  if(now > nextStateUpdate) {
     nextStateUpdate += stateUpdatePeriod;
     updateState();
+  }
+  if(now > nextEnergyUpdate) {
+    nextEnergyUpdate += energyUpdatePeriod;
+    updateEnergy();
   }
 
   while(Serial.available()) {
