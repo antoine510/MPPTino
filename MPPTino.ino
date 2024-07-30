@@ -7,12 +7,12 @@
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
-constexpr uint16_t mppVoltage_dV = 320;
+constexpr uint16_t mppVoltage_dv = 310;
 constexpr uint32_t minPowerMPPT_mw = 5000;
-constexpr uint16_t maxVoltageDeltaMPP_cv = 100;
+constexpr uint16_t maxVoltageDeltaMPP_cv = 100;   // Max voltage difference DAC vs actual when input voltage limited
+constexpr uint16_t wakeupVoltage_cv = 300;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long energyUpdatePeriod = 1000;
-constexpr uint16_t minWakeupVoltage_cv = 280;
 constexpr unsigned long wakeupCheckDuration = 500;
 constexpr unsigned long wakeupCheckPeriod = 10000;
 
@@ -46,33 +46,36 @@ uint32_t eout_mj = 0;
 class PowerTrendEstimator {
 public:
   void update() {
-    uint32_t pout_mw = (uint32_t)sdata.vout_dv * sdata.iout_ca;
-
-    avgPout_mw = (pout_mw + avgSamples * avgPout_mw + ((avgSamples + 1) / 2)) / (avgSamples + 1);
-    recentPout_mw = (pout_mw + recentSamples * recentPout_mw + ((recentSamples + 1) / 2)) / (recentSamples + 1);
+    uint16_t pout_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
+    if(_reset) {
+      avgPout_dw = pout_dw;
+      recentPout_dw = pout_dw;
+      _reset = false;
+    } else {
+      avgPout_dw = (pout_dw + avgSamples * avgPout_dw + ((avgSamples + 1) / 2)) / (avgSamples + 1);
+      recentPout_dw = (pout_dw + recentSamples * recentPout_dw + ((recentSamples + 1) / 2)) / (recentSamples + 1);
+    }
   }
 
   bool decreasing() {
-    bool res = (avgPout_mw - recentPout_mw) > powerDecreaseThreshold_mw;
-    if(res) recentPout_mw = avgPout_mw;
+    bool res = avgPout_dw > recentPout_dw + powerDecreaseThreshold_mw;
+    if(res) recentPout_dw = avgPout_dw;
     return res;
   }
 
-  void reset() {
-    avgPout_mw = 0;
-    recentPout_mw = 0;
-  }
+  void reset() { _reset = true; }
 
-  static constexpr uint32_t powerDecreaseThreshold_mw = 5000;
-  static constexpr uint8_t avgSamples = 15, recentSamples = 7;
-  uint32_t avgPout_mw = 0, recentPout_mw = 0;
+  static constexpr uint32_t powerDecreaseThreshold_mw = 2000;
+  static constexpr uint8_t avgSamples = 3, recentSamples = 1;
+  uint16_t avgPout_dw = 0, recentPout_dw = 0;
+  bool _reset = true;
 };
 PowerTrendEstimator powerTrend;
 
 MCP4716 dac;
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 255) * 350 / 47; }
 constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return dacVal * 47 / 350 + 255; }
-uint16_t dacValue = VoltageToDAC(mppVoltage_dV);
+uint16_t dacValue = VoltageToDAC(mppVoltage_dv);
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
@@ -108,7 +111,7 @@ void goToSleep() {
 }
 
 void wakeup() {
-  if(vinTransform_cV(analogRead(PIN_VIN)) < minWakeupVoltage_cv) return;
+  if(vinTransform_cV(analogRead(PIN_VIN)) < wakeupVoltage_cv) return;
 
   digitalWrite(PIN_EN_LTC3813, HIGH);
   digitalWrite(PIN_LED, HIGH);
@@ -141,19 +144,19 @@ void setup() {
   digitalWrite(PIN_EN_LTC3813, LOW);
   pinMode(PIN_EN_LTC3813, OUTPUT);
 
-  Serial.begin(9600);
-
   digitalWrite(PIN_TXEN, LOW);
   pinMode(PIN_TXEN, OUTPUT);
+
+  dac.SetValue(dacValue); // Initialize DAC to startup value
 
   digitalWrite(PIN_LED, LOW);
   pinMode(PIN_LED, OUTPUT);
 
+  Serial.begin(9600);
+
 #if USE_LCD
   setupLCD();
 #endif
-
-  dac.SetValue(dacValue); // Initialize DAC to startup value
 }
 
 void SendRS485(const uint8_t* data, size_t len) {
@@ -178,7 +181,7 @@ void runCommand(CommandID command) {
   case SET_MPP_MANUAL_DV:
     Serial.readBytes((uint8_t*)&manualMPP, sizeof(manualMPP));
     SetMPPVoltage(manualMPP);
-    digitalWrite(PIN_LED, HIGH);
+    if(!sleeping) digitalWrite(PIN_LED, HIGH);
     break;
   case SET_MPP_AUTO:
     manualMPP = 0;
@@ -194,7 +197,7 @@ void runCommand(CommandID command) {
 }
 
 void updateState() {
-  static bool increaseMPPV = true, blinkOn = false;
+  static bool increaseMPPV = true, LEDOn = false;
 
   readSensors();
   powerTrend.update();
@@ -202,18 +205,18 @@ void updateState() {
   if(sdata.iout_ca == 0) goToSleep();
 
   if(!manualMPP) {
-    if(powerTrend.avgPout_mw > minPowerMPPT_mw) {
+    if(powerTrend.avgPout_dw > minPowerMPPT_mw) {
       // Check if input voltage is controlled by DAC setting
       if(abs(sdata.vin_cv - DACToVoltage_dv(dacValue) * 10) < maxVoltageDeltaMPP_cv) {
         bool saturated = NudgeMPP(increaseMPPV);
         if(saturated || powerTrend.decreasing()) increaseMPPV = !increaseMPPV;
-        digitalWrite(PIN_LED, blinkOn);
-        blinkOn = !blinkOn;
+        digitalWrite(PIN_LED, LEDOn);
+        LEDOn = !LEDOn;
       } else {
         digitalWrite(PIN_LED, HIGH);
       }
     } else {
-      SetMPPVoltage(mppVoltage_dV);
+      SetMPPVoltage(mppVoltage_dv);
       digitalWrite(PIN_LED, HIGH);
     }
   }
@@ -249,7 +252,7 @@ void loop() {
     nextEnergyUpdate += energyUpdatePeriod;
     updateEnergy();
   }
-  if(!forceDisableOutput && now > nextWakeupCheck) {
+  if(!forceDisableOutput && sleeping && now > nextWakeupCheck) {
     nextWakeupCheck = millis() + wakeupCheckPeriod;
     wakeup();
   }
