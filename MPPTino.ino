@@ -7,7 +7,9 @@
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
-constexpr uint16_t startMPPVoltage_dv = 300;
+constexpr uint16_t resetMPPVoltage_dv = 300;
+constexpr uint16_t maxMPPVoltage_dv = 350;
+constexpr uint16_t minMPPVoltage_dv = 290;
 constexpr uint16_t minPowerMPPT_dw = 50;
 constexpr uint16_t maxVoltageDeltaMPP_dv = 10;   // Max voltage difference DAC vs actual when input voltage limited
 constexpr uint16_t wakeupVoltage_cv = 3200;
@@ -43,38 +45,12 @@ struct SerialData {
 };
 SerialData sdata;
 uint32_t eout_mj = 0;
-
-class PowerTrendEstimator {
-public:
-  void update() {
-    uint16_t pout_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
-    if(_reset) {
-      data[0] = data[1] = data[2] = data[3] = pout_dw;
-      _reset = false;
-    } else {
-      data[idx] = pout_dw;
-      idx = (idx + 1) % 4;
-    }
-  }
-
-  uint16_t power_dw() { return data[idx]; }
-
-  bool decreasing() {
-    return (data[0] + data[1] + data[2] + data[3]) / 40 > (data[idx] + data[(idx + 3) % 4]) / 20;
-  }
-
-  void reset() { _reset = true; }
-
-  uint16_t data[4];
-  uint8_t idx = 0;
-  bool _reset = true;
-};
-PowerTrendEstimator powerTrend;
+uint16_t power_dw = 0;
 
 MCP4716 dac;
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
 constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return dacVal / 9 + 261; }
-uint16_t dacValue = VoltageToDAC(startMPPVoltage_dv);
+uint16_t dacValue = VoltageToDAC(resetMPPVoltage_dv);
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
@@ -88,12 +64,13 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 }
 
 bool NudgeMPP(bool increase) {
+  constexpr uint16_t dacMin = VoltageToDAC(minMPPVoltage_dv), dacMax = VoltageToDAC(maxMPPVoltage_dv);
   if(increase) {
-    if(dacValue < 1024 - dacStep) dacValue += dacStep;
-    else return true;
+    if(dacValue <= dacMax - dacStep) dacValue += dacStep;
+    else { dacValue = dacMax; return true; }
   } else {
-    if(dacValue >= dacStep) dacValue -= dacStep;
-    else return true;
+    if(dacValue >= dacMin + dacStep) dacValue -= dacStep;
+    else { dacValue = dacMin; return true; }
   }
   dac.SetValue(dacValue);
   return false;
@@ -117,7 +94,6 @@ void wakeup() {
   while(millis() < wakeupDeadline) {
     if(analogRead(PIN_IOUT) > 0) {
       sleeping = false;
-      powerTrend.reset();
       return;
     }
   }
@@ -198,23 +174,26 @@ void updateState() {
   static bool increaseMPPV = true, LEDOn = false;
 
   readSensors();
-  powerTrend.update();
 
   if(sdata.iout_ca == 0) goToSleep();
 
+  uint16_t lastPower_dw = power_dw;
+  power_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
+
   if(!manualMPP_dv) {
-    if(powerTrend.power_dw() > minPowerMPPT_dw) {
+    if(power_dw > minPowerMPPT_dw) {
       // Check if input voltage is controlled by DAC setting
       if(sdata.vin_cv / 10 < DACToVoltage_dv(dacValue) + maxVoltageDeltaMPP_dv) {
-        if(powerTrend.decreasing()) increaseMPPV = !increaseMPPV;
-        NudgeMPP(increaseMPPV);
+        if(power_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
+        if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
         digitalWrite(PIN_LED, LEDOn);
         LEDOn = !LEDOn;
       } else {
+        SetMPPVoltage(resetMPPVoltage_dv);
         digitalWrite(PIN_LED, HIGH);
       }
     } else {
-      SetMPPVoltage(startMPPVoltage_dv);
+      SetMPPVoltage(resetMPPVoltage_dv);
       if(!sleeping) digitalWrite(PIN_LED, HIGH);
     }
   }
@@ -301,7 +280,7 @@ void updateLCD() {
   iout /= 10;
   ST7565::drawchar_aligned(0, 4, iout ? iout + 48 : 0);
 
-  uint16_t pout = powerTrend.power_dw() / 10;
+  uint16_t pout = power_dw / 10;
   ST7565::drawchar_aligned(3, 6, pout % 10 + 48);
   pout /= 10;
   ST7565::drawchar_aligned(2, 6, pout ? pout % 10 + 48 : 0);
