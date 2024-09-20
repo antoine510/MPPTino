@@ -1,18 +1,18 @@
 #include <EEPROM.h>
 #include <MCP4716.h>
 
-#define USE_LCD 1
+#define USE_LCD 0
 #if USE_LCD
 #include <ST7565.h>
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
 constexpr uint16_t resetMPPVoltage_dv = 300;
-constexpr uint16_t maxMPPVoltage_dv = 350;
+constexpr uint16_t maxMPPVoltage_dv = 340;
 constexpr uint16_t minMPPVoltage_dv = 290;
 constexpr uint16_t minPowerMPPT_dw = 50;
 constexpr uint16_t maxVoltageDeltaMPP_dv = 10;   // Max voltage difference DAC vs actual when input voltage limited
-constexpr uint16_t wakeupVoltage_cv = 3200;
+constexpr uint16_t wakeupVoltage_cv = 3300;
 constexpr uint16_t dacStep = 3;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long energyUpdatePeriod = 1000;
@@ -64,16 +64,17 @@ void SetMPPVoltage(uint16_t mppv_dv) {
 }
 
 bool NudgeMPP(bool increase) {
-  constexpr uint16_t dacMin = VoltageToDAC(minMPPVoltage_dv), dacMax = VoltageToDAC(maxMPPVoltage_dv);
+  static constexpr uint16_t dacMin = VoltageToDAC(minMPPVoltage_dv), dacMax = VoltageToDAC(maxMPPVoltage_dv);
+  bool saturation = false;
   if(increase) {
-    if(dacValue <= dacMax - dacStep) dacValue += dacStep;
-    else { dacValue = dacMax; return true; }
+    if(dacValue < dacMax - dacStep) dacValue += dacStep;
+    else { dacValue = dacMax; saturation = true; }
   } else {
-    if(dacValue >= dacMin + dacStep) dacValue -= dacStep;
-    else { dacValue = dacMin; return true; }
+    if(dacValue > dacMin + dacStep) dacValue -= dacStep;
+    else { dacValue = dacMin; saturation = true; }
   }
   dac.SetValue(dacValue);
-  return false;
+  return saturation;
 }
 
 bool sleeping = true;
@@ -155,7 +156,6 @@ void runCommand(CommandID command) {
   case SET_MPP_MANUAL_DV:
     Serial.readBytes((uint8_t*)&manualMPP_dv, sizeof(manualMPP_dv));
     SetMPPVoltage(manualMPP_dv);
-    if(!sleeping) digitalWrite(PIN_LED, HIGH);
     break;
   case SET_MPP_AUTO:
     manualMPP_dv = 0;
@@ -171,7 +171,7 @@ void runCommand(CommandID command) {
 }
 
 void updateState() {
-  static bool increaseMPPV = true, LEDOn = false;
+  static bool increaseMPPV = true;
 
   readSensors();
 
@@ -186,15 +186,9 @@ void updateState() {
       if(sdata.vin_cv / 10 < DACToVoltage_dv(dacValue) + maxVoltageDeltaMPP_dv) {
         if(power_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
         if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
-        digitalWrite(PIN_LED, LEDOn);
-        LEDOn = !LEDOn;
-      } else {
-        SetMPPVoltage(resetMPPVoltage_dv);
-        digitalWrite(PIN_LED, HIGH);
       }
     } else {
       SetMPPVoltage(resetMPPVoltage_dv);
-      if(!sleeping) digitalWrite(PIN_LED, HIGH);
     }
   }
 
