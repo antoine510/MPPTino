@@ -42,6 +42,7 @@ struct SerialData {
   uint16_t vout_dv;
   uint16_t iout_ca;
   uint16_t eout_j;
+  uint8_t crc;
 };
 SerialData sdata;
 uint32_t eout_mj = 0;
@@ -151,6 +152,7 @@ void runCommand(CommandID command) {
   case READ_ALL:
     sdata.eout_j = eout_mj / 1000;
     eout_mj = 0;
+    sdata.crc = crc((uint8_t*)&sdata, sizeof(SerialData) - 1);
     SendRS485((uint8_t*)(&sdata), sizeof(SerialData));
     break;
   case SET_MPP_MANUAL_DV:
@@ -231,6 +233,20 @@ void loop() {
   while(Serial.available()) {
     serial_state = (SerialSeq)updateSerialState(Serial.read());
   }
+}
+
+uint8_t crc(uint8_t *data, uint8_t len) {
+  uint8_t crc = 0x00;
+  for (uint8_t b = 0; b < len; ++b) {
+    crc ^= data[b];
+    for (uint8_t i = 0; i < 8; ++i) {
+      if (crc & 0x80)
+        crc = (crc << 1) ^ 0x07;	// SMBUS CRC8
+      else
+        crc = crc << 1;
+    }
+  }
+  return crc;
 }
 
 #if USE_LCD
