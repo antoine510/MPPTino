@@ -8,4 +8,5 @@
 void setup() {
   EEPROM.write(0, BOARD_ID);
 }
+void loop() {}
 ```
