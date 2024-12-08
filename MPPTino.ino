@@ -7,17 +7,15 @@
 #endif
 
 constexpr uint8_t MAGIC_NUMBER = 0x42;
-constexpr uint16_t resetMPPVoltage_dv = 300;
-constexpr uint16_t maxMPPVoltage_dv = 340;
-constexpr uint16_t minMPPVoltage_dv = 290;
+constexpr uint16_t maxMPPVoltage_dv = 350;
+constexpr uint16_t minMPPVoltage_dv = 280;
 constexpr uint16_t minPowerMPPT_dw = 50;
-constexpr uint16_t maxVoltageDeltaMPP_dv = 10;   // Max voltage difference DAC vs actual when input voltage limited
 constexpr uint16_t wakeupVoltage_cv = 3300;
-constexpr uint16_t dacStep = 3;
+constexpr uint16_t dacStep = 4;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long energyUpdatePeriod = 1000;
 constexpr unsigned long wakeupCheckDuration = 500;
-constexpr unsigned long wakeupCheckPeriod = 10000;
+constexpr unsigned long wakeupCheckPeriod = 60000;
 
 enum Pins {
   PIN_VIN = A1,
@@ -50,8 +48,7 @@ uint16_t power_dw = 0;
 
 MCP4716 dac;
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
-constexpr uint16_t DACToVoltage_dv(uint16_t dacVal) { return dacVal / 9 + 261; }
-uint16_t dacValue = VoltageToDAC(resetMPPVoltage_dv);
+uint16_t dacValue = VoltageToDAC(minMPPVoltage_dv);
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
@@ -83,6 +80,7 @@ void goToSleep() {
   if(sleeping) return;
   digitalWrite(PIN_EN_LTC3813, LOW);
   digitalWrite(PIN_LED, LOW);
+  SetMPPVoltage(minMPPVoltage_dv);
   sleeping = true;
 }
 
@@ -184,13 +182,10 @@ void updateState() {
 
   if(!manualMPP_dv) {
     if(power_dw > minPowerMPPT_dw) {
-      // Check if input voltage is controlled by DAC setting
-      if(sdata.vin_cv / 10 < DACToVoltage_dv(dacValue) + maxVoltageDeltaMPP_dv) {
-        if(power_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
-        if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
-      }
+      if(power_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
+      if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
     } else {
-      SetMPPVoltage(resetMPPVoltage_dv);
+      SetMPPVoltage(minMPPVoltage_dv);
     }
   }
 
