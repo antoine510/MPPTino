@@ -6,14 +6,13 @@
 #include <ST7565.h>
 #endif
 
-constexpr uint8_t MAGIC_NUMBER = 0x42;
 constexpr uint16_t maxMPPVoltage_dv = 350;
 constexpr uint16_t minMPPVoltage_dv = 280;
 constexpr uint16_t minPowerMPPT_dw = 50;
 constexpr uint16_t wakeupVoltage_cv = 3300;
 constexpr uint16_t dacStep = 4;
 constexpr unsigned long stateUpdatePeriod = 500;
-constexpr unsigned long energyUpdatePeriod = 1000;
+constexpr unsigned long stateAveragingPeriod = 60000;
 constexpr unsigned long wakeupCheckDuration = 500;
 constexpr unsigned long wakeupCheckPeriod = 60000;
 
@@ -35,16 +34,27 @@ enum CommandID : uint8_t {
   DISABLE_OUTPUT = 0x5
 };
 
-struct SerialData {
+struct PowerPoint {
   uint16_t vin_cv;
   uint16_t vout_dv;
   uint16_t iout_ca;
-  uint16_t eout_j;
-  uint8_t crc;
+  uint16_t pout_dw;
 };
-SerialData sdata;
-uint32_t eout_mj = 0;
-uint16_t power_dw = 0;
+PowerPoint power{};
+
+struct SummedPowerPoint {
+  uint32_t vin_cv;
+  uint32_t vout_dv;
+  uint32_t iout_ca;
+  uint32_t pout_dw;
+};
+PowerPoint operator/(SummedPowerPoint sum, uint8_t s) {
+  return {sum.vin_cv / s, sum.vout_dv / s, sum.iout_ca / s, sum.pout_dw / s};
+}
+SummedPowerPoint summedPower{};
+uint8_t numSamples = 0;
+
+PowerPoint averagePower{};
 
 MCP4716 dac;
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
@@ -103,15 +113,16 @@ void wakeup() {
 }
 
 void readSensors() {
-  sdata.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
-  sdata.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
-  sdata.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
-  if(sdata.iout_ca > 0) sdata.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
-}
-
-void updateEnergy() {
-  static_assert(energyUpdatePeriod == 1000ul);
-  eout_mj += (uint32_t)sdata.vout_dv * sdata.iout_ca;
+  power.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
+  summedPower.vin_cv += power.vin_cv;
+  power.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
+  summedPower.vout_dv += power.vout_dv;
+  power.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
+  if(power.iout_ca > 0) power.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
+  summedPower.iout_ca += power.iout_ca;
+  power.pout_dw = (uint32_t)power.iout_ca * power.vout_dv / 100;
+  summedPower.pout_dw += power.pout_dw;
+  numSamples++;
 }
 
 void setup() {
@@ -134,8 +145,10 @@ void setup() {
 }
 
 void SendRS485(const uint8_t* data, size_t len) {
+  const uint8_t msg_crc = crc(data, len);
   PORTD |= 0x04;
   Serial.write(data, len);
+  Serial.write(msg_crc);
   Serial.flush();
   PORTD &= 0xfb;
 }
@@ -143,15 +156,13 @@ void SendRS485(const uint8_t* data, size_t len) {
 uint16_t manualMPP_dv = 0; // 0 for automatic
 bool forceDisableOutput = false;
 void runCommand(CommandID command) {
+  constexpr uint8_t MAGIC_NUMBER = 0x42;
   switch(command) {
   case MAGIC:
     SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER));
     break;
   case READ_ALL:
-    sdata.eout_j = eout_mj / 1000;
-    eout_mj = 0;
-    sdata.crc = crc((uint8_t*)&sdata, sizeof(SerialData) - 1);
-    SendRS485((uint8_t*)(&sdata), sizeof(SerialData));
+    SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
     break;
   case SET_MPP_MANUAL_DV:
     Serial.readBytes((uint8_t*)&manualMPP_dv, sizeof(manualMPP_dv));
@@ -172,21 +183,27 @@ void runCommand(CommandID command) {
 
 void updateState() {
   static bool increaseMPPV = true;
+  static uint16_t lastPower_dw = 0;
 
   readSensors();
 
-  if(sdata.iout_ca == 0) goToSleep();
-
-  uint16_t lastPower_dw = power_dw;
-  power_dw = (uint32_t)sdata.vout_dv * sdata.iout_ca / 100;
+  if(power.iout_ca == 0) goToSleep();
 
   if(!manualMPP_dv) {
-    if(power_dw > minPowerMPPT_dw) {
-      if(power_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
+    if(power.pout_dw > minPowerMPPT_dw) {
+      if(power.pout_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
       if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
     } else {
       SetMPPVoltage(minMPPVoltage_dv);
     }
+  }
+
+  lastPower_dw = power.pout_dw;
+
+  if(numSamples >= (stateAveragingPeriod / stateUpdatePeriod)) {
+    averagePower = summedPower / numSamples;
+    memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
+    numSamples = 0;
   }
 
 #if USE_LCD
@@ -210,15 +227,11 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 void loop() {
-  static unsigned long nextStateUpdate = 0, nextEnergyUpdate = 0, nextWakeupCheck = 0;
+  static unsigned long nextStateUpdate = 0, nextWakeupCheck = 0;
   auto now = millis();
   if(now > nextStateUpdate) {
     nextStateUpdate += stateUpdatePeriod;
     updateState();
-  }
-  if(now > nextEnergyUpdate) {
-    nextEnergyUpdate += energyUpdatePeriod;
-    updateEnergy();
   }
   if(now > nextWakeupCheck) {
     nextWakeupCheck += wakeupCheckPeriod;
@@ -262,21 +275,21 @@ void setupLCD() {
 }
 
 void updateLCD() {
-  auto vin = sdata.vin_cv / 10;
+  auto vin = power.vin_cv / 10;
   ST7565::drawchar_aligned(3, 0, vin % 10 + 48);
   vin /= 10;
   ST7565::drawchar_aligned(1, 0, vin % 10 + 48);
   vin /= 10;
   ST7565::drawchar_aligned(0, 0, vin ? vin + 48 : 0);
 
-  auto vout = sdata.vout_dv;
+  auto vout = power.vout_dv;
   ST7565::drawchar_aligned(3, 2, vout % 10 + 48);
   vout /= 10;
   ST7565::drawchar_aligned(1, 2, vout % 10 + 48);
   vout /= 10;
   ST7565::drawchar_aligned(0, 2, vout ? vout + 48 : 0);
 
-  auto iout = sdata.iout_ca;
+  auto iout = power.iout_ca;
   ST7565::drawchar_aligned(4, 4, iout % 10 + 48);
   iout /= 10;
   ST7565::drawchar_aligned(3, 4, iout % 10 + 48);
@@ -285,7 +298,7 @@ void updateLCD() {
   iout /= 10;
   ST7565::drawchar_aligned(0, 4, iout ? iout + 48 : 0);
 
-  uint16_t pout = power_dw / 10;
+  uint16_t pout = power.pout_dw / 10;
   ST7565::drawchar_aligned(3, 6, pout % 10 + 48);
   pout /= 10;
   ST7565::drawchar_aligned(2, 6, pout ? pout % 10 + 48 : 0);
