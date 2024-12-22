@@ -1,5 +1,6 @@
 #include <EEPROM.h>
 #include <MCP4716.h>
+#include <avr/wdt.h>
 
 #define USE_LCD 0
 #if USE_LCD
@@ -14,7 +15,7 @@ constexpr uint16_t dacStep = 4;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long stateAveragingPeriod = 60000;
 constexpr unsigned long wakeupCheckDuration = 500;
-constexpr unsigned long wakeupCheckPeriod = 60000;
+constexpr unsigned long wakeupCheckWDTP = 7;  // wakeup check period in multiples of WDR period (8s)
 
 enum Pins {
   PIN_VIN = A1,
@@ -22,7 +23,7 @@ enum Pins {
   PIN_IOUT = A3,
   PIN_TXEN = 2,         // PD2
   PIN_EN_LTC3813 = 3,   // PD3
-  PIN_LED = 13
+  PIN_LED = 13          // PB5
 };
 
 enum CommandID : uint8_t {
@@ -49,20 +50,28 @@ struct SummedPowerPoint {
   uint32_t pout_dw;
 };
 PowerPoint operator/(SummedPowerPoint sum, uint8_t s) {
-  return {sum.vin_cv / s, sum.vout_dv / s, sum.iout_ca / s, sum.pout_dw / s};
+  return {(uint16_t)(sum.vin_cv / s), (uint16_t)(sum.vout_dv / s), (uint16_t)(sum.iout_ca / s), (uint16_t)(sum.pout_dw / s)};
+}
+SummedPowerPoint operator+(SummedPowerPoint sum, PowerPoint a) {
+  return {sum.vin_cv + a.vin_cv, sum.vout_dv + a.vout_dv, sum.iout_ca + a.iout_ca, sum.pout_dw + a.pout_dw};
 }
 SummedPowerPoint summedPower{};
 uint8_t numSamples = 0;
 
 PowerPoint averagePower{};
+void updateAverage() {
+  averagePower = summedPower / numSamples;
+  memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
+  numSamples = 0;
+}
 
 MCP4716 dac;
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
-uint16_t dacValue = VoltageToDAC(minMPPVoltage_dv);
+uint16_t dacValue = 0;
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
-constexpr uint16_t ioutTransform_cA(uint16_t count) { return count * 8 / 5; }
+constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? count * 8 / 5 + 5 : 0; }
 
 void SetMPPVoltage(uint16_t mppv_dv) {
   auto newDACValue = VoltageToDAC(mppv_dv);
@@ -85,72 +94,90 @@ bool NudgeMPP(bool increase) {
   return saturation;
 }
 
-bool sleeping = true;
+void SendRS485(const uint8_t* data, size_t len, bool withCRC = true);
+inline void enableADC() { ADCSRA |= _BV(ADEN); }
+inline void disableADC() { ADCSRA &= ~_BV(ADEN); }
+
+bool sleeping = false;
+volatile uint8_t wdtWakeups = 0;  // 8s each
 void goToSleep() {
-  if(sleeping) return;
-  digitalWrite(PIN_EN_LTC3813, LOW);
-  digitalWrite(PIN_LED, LOW);
   SetMPPVoltage(minMPPVoltage_dv);
+  PORTD &= ~_BV(PORTD3);
+  PORTB &= ~_BV(PORTB5);
+  disableADC();
+
   sleeping = true;
+  wdtWakeups = 0;
+}
+
+void resumeSleep() {
+  SMCR = _BV(SM1) | _BV(SE);
+  sleep_cpu();
+  SMCR = 0;
 }
 
 void wakeup() {
-  if(vinTransform_cV(analogRead(PIN_VIN)) < wakeupVoltage_cv) return;
+  if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
+    PORTD |= _BV(PORTD3);
+    PORTB |= _BV(PORTB5);
 
-  digitalWrite(PIN_EN_LTC3813, HIGH);
-  digitalWrite(PIN_LED, HIGH);
+    unsigned long wakeupDeadline = millis() + wakeupCheckDuration;
+    do {
+      if(analogRead(PIN_IOUT) > 0) {
+        sleeping = false;
+        return;
+      }
+    } while(millis() < wakeupDeadline);
 
-  unsigned long wakeupDeadline = millis() + wakeupCheckDuration;
-  while(millis() < wakeupDeadline) {
-    if(analogRead(PIN_IOUT) > 0) {
-      sleeping = false;
-      return;
-    }
+    PORTD &= ~_BV(PORTD3);
+    PORTB &= ~_BV(PORTB5);
   }
-
-  digitalWrite(PIN_EN_LTC3813, LOW);
-  digitalWrite(PIN_LED, LOW);
 }
 
 void readSensors() {
   power.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
-  summedPower.vin_cv += power.vin_cv;
   power.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
-  summedPower.vout_dv += power.vout_dv;
   power.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
-  if(power.iout_ca > 0) power.iout_ca += 5; // Compensates for input offset voltage of sense amplifier
-  summedPower.iout_ca += power.iout_ca;
   power.pout_dw = (uint32_t)power.iout_ca * power.vout_dv / 100;
-  summedPower.pout_dw += power.pout_dw;
+  summedPower = summedPower + power;
   numSamples++;
 }
 
+ISR(WDT_vect) {
+  wdtWakeups++;
+}
+
+extern "C" void __attribute__((naked, used, section (".init3"))) init3() {
+  DDRB = _BV(DDRB5);
+  DDRD = _BV(DDRD2) | _BV(DDRD3);
+}
+
 void setup() {
-  digitalWrite(PIN_EN_LTC3813, LOW);
-  pinMode(PIN_EN_LTC3813, OUTPUT);
-
-  digitalWrite(PIN_TXEN, LOW);
-  pinMode(PIN_TXEN, OUTPUT);
-
-  dac.SetValue(dacValue); // Initialize DAC to startup value
-
-  digitalWrite(PIN_LED, LOW);
-  pinMode(PIN_LED, OUTPUT);
-
   Serial.begin(9600);
+
+  // Enable wakeup on serial byte complete, RXCIE is set by Serial.begin
+  UCSR0D = _BV(SFDE);
+  // Enable watchdog to wakeup every 8s
+  cli();
+  wdt_reset();
+  WDTCSR |= _BV(WDCE) | _BV(WDE); // Enable WDT changes
+  WDTCSR = _BV(WDIE) | _BV(WDP3) | _BV(WDP0); // Setup watchdog wakeup in 8s
+  sei();
 
 #if USE_LCD
   setupLCD();
 #endif
+
+  goToSleep();
 }
 
-void SendRS485(const uint8_t* data, size_t len) {
+void SendRS485(const uint8_t* data, size_t len, bool withCRC) {
   const uint8_t msg_crc = crc(data, len);
-  PORTD |= 0x04;
+  PORTD |= _BV(PORTD2);
   Serial.write(data, len);
-  Serial.write(msg_crc);
+  if(withCRC) Serial.write(msg_crc);
   Serial.flush();
-  PORTD &= 0xfb;
+  PORTD &= ~_BV(PORTD2);
 }
 
 uint16_t manualMPP_dv = 0; // 0 for automatic
@@ -159,7 +186,7 @@ void runCommand(CommandID command) {
   constexpr uint8_t MAGIC_NUMBER = 0x42;
   switch(command) {
   case MAGIC:
-    SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER));
+    SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER), false);
     break;
   case READ_ALL:
     SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
@@ -176,7 +203,7 @@ void runCommand(CommandID command) {
     break;
   case DISABLE_OUTPUT:
     forceDisableOutput = true;
-    goToSleep();
+    if(!sleeping) goToSleep();
     break;
   }
 }
@@ -187,7 +214,7 @@ void updateState() {
 
   readSensors();
 
-  if(power.iout_ca == 0) goToSleep();
+  if(power.iout_ca == 0 && !sleeping) goToSleep();
 
   if(!manualMPP_dv) {
     if(power.pout_dw > minPowerMPPT_dw) {
@@ -199,12 +226,6 @@ void updateState() {
   }
 
   lastPower_dw = power.pout_dw;
-
-  if(numSamples >= (stateAveragingPeriod / stateUpdatePeriod)) {
-    averagePower = summedPower / numSamples;
-    memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
-    numSamples = 0;
-  }
 
 #if USE_LCD
   updateLCD();
@@ -227,15 +248,25 @@ uint8_t updateSerialState(uint8_t byte) {
 }
 
 void loop() {
-  static unsigned long nextStateUpdate = 0, nextWakeupCheck = 0;
-  auto now = millis();
-  if(now > nextStateUpdate) {
-    nextStateUpdate += stateUpdatePeriod;
-    updateState();
-  }
-  if(now > nextWakeupCheck) {
-    nextWakeupCheck += wakeupCheckPeriod;
-    if(!forceDisableOutput && sleeping) wakeup();
+  static unsigned long nextStateUpdate = 0;
+  if(!sleeping) {
+    if(millis() > nextStateUpdate) {
+      nextStateUpdate += stateUpdatePeriod;
+      updateState();
+      if(numSamples >= (stateAveragingPeriod / stateUpdatePeriod)) updateAverage();
+    }
+  } else {
+    resumeSleep();
+    if(wdtWakeups >= wakeupCheckWDTP) {
+      enableADC();
+      if(!forceDisableOutput) wakeup();
+      if(sleeping) {  // Did not wakeup
+        updateState();
+        disableADC();
+        updateAverage();
+        wdtWakeups = 0;
+      }
+    }
   }
 
   while(Serial.available()) {
@@ -243,7 +274,7 @@ void loop() {
   }
 }
 
-uint8_t crc(uint8_t *data, uint8_t len) {
+uint8_t crc(const uint8_t* data, uint8_t len) {
   uint8_t crc = 0x00;
   for (uint8_t b = 0; b < len; ++b) {
     crc ^= data[b];
@@ -259,7 +290,7 @@ uint8_t crc(uint8_t *data, uint8_t len) {
 
 #if USE_LCD
 void setupLCD() {
-  ST7565::begin(0x03);
+  ST7565::begin(0);
   ST7565::clear();
 
   ST7565::drawchar_aligned(2, 0, '.');
