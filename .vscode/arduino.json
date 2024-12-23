@@ -1,7 +1,0 @@
-{
-    "output": "build/",
-    "sketch": "MPPTino.ino",
-    "configuration": "bootloader=no_bootloader,eeprom=keep,variant=modelPB,BOD=2v7,LTO=Os_flto,clock=1MHz_internal",
-    "board": "MiniCore:avr:328",
-    "programmer": "usbasp"
-}
