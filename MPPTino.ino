@@ -121,16 +121,13 @@ void wakeup() {
     PORTD |= _BV(PORTD3);
     PORTB |= _BV(PORTB5);
 
-    unsigned long wakeupDeadline = millis() + wakeupCheckDuration;
-    do {
-      if(analogRead(PIN_IOUT) > 0) {
-        sleeping = false;
-        return;
-      }
-    } while(millis() < wakeupDeadline);
-
-    PORTD &= ~_BV(PORTD3);
-    PORTB &= ~_BV(PORTB5);
+    delay(wakeupCheckDuration);
+    if(analogRead(PIN_IOUT) > 0) {
+      sleeping = false;
+    } else {
+      PORTD &= ~_BV(PORTD3);
+      PORTB &= ~_BV(PORTB5);
+    }
   }
 }
 
@@ -167,6 +164,9 @@ void setup() {
 #if USE_LCD
   setupLCD();
 #endif
+
+  readSensors();
+  updateAverage();
 
   goToSleep();
 }
@@ -260,12 +260,12 @@ void loop() {
     if(wdtWakeups >= wakeupCheckWDTP) {
       enableADC();
       if(!forceDisableOutput) wakeup();
+      updateState();
       if(sleeping) {  // Did not wakeup
-        updateState();
         disableADC();
-        updateAverage();
         wdtWakeups = 0;
       }
+      updateAverage();
     }
   }
 
