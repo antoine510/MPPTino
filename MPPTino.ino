@@ -15,7 +15,7 @@ constexpr uint16_t dacStep = 4;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long stateAveragingPeriod = 60000;
 constexpr unsigned long wakeupCheckDuration = 500;
-constexpr unsigned long wakeupCheckWDTP = 7;  // wakeup check period in multiples of WDR period (8s)
+constexpr unsigned long wakeupCheckWDTP = 6;  // wakeup check period in multiples of WDR period (9.8s @-8°C to 10s @32°C)
 
 enum Pins {
   PIN_VIN = A1,
@@ -58,11 +58,22 @@ SummedPowerPoint operator+(SummedPowerPoint sum, PowerPoint a) {
 SummedPowerPoint summedPower{};
 uint8_t numSamples = 0;
 
-PowerPoint averagePower{};
+PowerPoint averagePower;
+bool validAverage = false;
 void updateAverage() {
   averagePower = summedPower / numSamples;
   memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
   numSamples = 0;
+}
+void updateAverageFromSleep() {
+  validAverage = power.vin_cv > 1000; // LMR16006 buck converter is not reliable under 10V
+  if(validAverage) {
+    averagePower.vin_cv = power.vin_cv;
+    averagePower.vout_dv = power.vout_dv;
+    // We were just sleeping, thus set amps and power to 0 for that period
+    averagePower.iout_ca = 0;
+    averagePower.pout_dw = 0;
+  }
 }
 
 MCP4716 dac;
@@ -99,8 +110,9 @@ inline void enableADC() { ADCSRA |= _BV(ADEN); }
 inline void disableADC() { ADCSRA &= ~_BV(ADEN); }
 
 bool sleeping = false;
-volatile uint8_t wdtWakeups = 0;  // 8s each
+volatile uint8_t wdtWakeups = 0;  // About 10s each
 void goToSleep() {
+  if(numSamples) updateAverage(); // Update average with all data samples until now
   SetMPPVoltage(minMPPVoltage_dv);
   PORTD &= ~_BV(PORTD3);
   PORTB &= ~_BV(PORTB5);
@@ -136,8 +148,6 @@ void readSensors() {
   power.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
   power.iout_ca = ioutTransform_cA(analogRead(PIN_IOUT));
   power.pout_dw = (uint32_t)power.iout_ca * power.vout_dv / 100;
-  summedPower = summedPower + power;
-  numSamples++;
 }
 
 ISR(WDT_vect) {
@@ -165,9 +175,6 @@ void setup() {
   setupLCD();
 #endif
 
-  readSensors();
-  updateAverage();
-
   goToSleep();
 }
 
@@ -189,7 +196,7 @@ void runCommand(CommandID command) {
     SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER), false);
     break;
   case READ_ALL:
-    SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
+    if(validAverage) SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
     break;
   case SET_MPP_MANUAL_DV:
     Serial.readBytes((uint8_t*)&manualMPP_dv, sizeof(manualMPP_dv));
@@ -213,6 +220,9 @@ void updateState() {
   static uint16_t lastPower_dw = 0;
 
   readSensors();
+
+  summedPower = summedPower + power;
+  numSamples++;
 
   if(power.iout_ca == 0 && !sleeping) goToSleep();
 
@@ -259,13 +269,14 @@ void loop() {
     resumeSleep();
     if(wdtWakeups >= wakeupCheckWDTP) {
       enableADC();
+      readSensors();
+#if USE_LCD
+      updateLCD();
+#endif
+      updateAverageFromSleep();
       if(!forceDisableOutput) wakeup();
-      updateState();
-      if(sleeping) {  // Did not wakeup
-        disableADC();
-        wdtWakeups = 0;
-      }
-      updateAverage();
+      if(sleeping) disableADC();
+      wdtWakeups = 0;
     }
   }
 
