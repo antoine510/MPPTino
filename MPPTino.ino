@@ -49,19 +49,21 @@ struct SummedPowerPoint {
   uint32_t iout_ca;
   uint32_t pout_dw;
 };
-PowerPoint operator/(SummedPowerPoint sum, uint8_t s) {
-  return {(uint16_t)(sum.vin_cv / s), (uint16_t)(sum.vout_dv / s), (uint16_t)(sum.iout_ca / s), (uint16_t)(sum.pout_dw / s)};
-}
 SummedPowerPoint operator+(SummedPowerPoint sum, PowerPoint a) {
   return {sum.vin_cv + a.vin_cv, sum.vout_dv + a.vout_dv, sum.iout_ca + a.iout_ca, sum.pout_dw + a.pout_dw};
 }
 SummedPowerPoint summedPower{};
 uint8_t numSamples = 0;
+constexpr uint8_t maxSamples = stateAveragingPeriod / stateUpdatePeriod;
 
 PowerPoint averagePower;
 bool validAverage = false;
 void updateAverage() {
-  averagePower = summedPower / numSamples;
+  averagePower.vin_cv = (uint16_t)(summedPower.vin_cv / numSamples);
+  averagePower.vout_dv = (uint16_t)(summedPower.vout_dv / numSamples);
+  // Current and power are 0 for all samples between numSamples and maxSamples
+  averagePower.iout_ca = (uint16_t)(summedPower.iout_ca / maxSamples);
+  averagePower.pout_dw = (uint16_t)(summedPower.pout_dw / maxSamples);
   memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
   numSamples = 0;
 }
@@ -219,12 +221,14 @@ void updateState() {
   static bool increaseMPPV = true;
   static uint16_t lastPower_dw = 0;
 
+  const bool noCurrentBefore = power.iout_ca == 0;
+
   readSensors();
 
   summedPower = summedPower + power;
   numSamples++;
 
-  if(power.iout_ca == 0 && !sleeping) goToSleep();
+  if(noCurrentBefore && power.iout_ca == 0) goToSleep();
 
   if(!manualMPP_dv) {
     if(power.pout_dw > minPowerMPPT_dw) {
@@ -260,10 +264,11 @@ uint8_t updateSerialState(uint8_t byte) {
 void loop() {
   static unsigned long nextStateUpdate = 0;
   if(!sleeping) {
-    if(millis() > nextStateUpdate) {
-      nextStateUpdate += stateUpdatePeriod;
+    const unsigned long now = millis();
+    if(now >= nextStateUpdate) {  // Safe to compare absolute times because we reboot at least every night
+      nextStateUpdate = now + stateUpdatePeriod;
       updateState();
-      if(numSamples >= (stateAveragingPeriod / stateUpdatePeriod)) updateAverage();
+      if(numSamples == maxSamples) updateAverage();
     }
   } else {
     resumeSleep();
