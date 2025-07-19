@@ -12,6 +12,7 @@ constexpr uint16_t minMPPVoltage_dv = 280;
 constexpr uint16_t minPowerMPPT_dw = 50;
 constexpr uint16_t wakeupVoltage_cv = 3300;
 constexpr uint16_t dacStep = 8;
+constexpr uint8_t dacVarient = 0;
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long stateAveragingPeriod = 60000;
 constexpr unsigned long wakeupCheckDuration = 500;
@@ -78,7 +79,7 @@ void updateAverageFromSleep() {
   }
 }
 
-MCP4716 dac;
+MCP4716 dac(dacVarient);
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
 uint16_t dacValue = 0;
 
