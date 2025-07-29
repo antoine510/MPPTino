@@ -50,6 +50,13 @@ void setup() {
 void loop() {}
 ```
 
+## Setting up the fuses
+
+The correct fuse configuration is as follows:
+- efuse is set to `0xf4`. This enables the BOD at 4.3 V.
+- hfuse is set to `0xd7`. This preserves the EEPROM contents and disables the bootloader.
+- lfuse is set to `0xc2`. This sets the internal RC oscillator as clock source and 8 MHz as frequency. This also enables fast startup.
+
 ## LCD
 
 This MPPT can use a ST7565 compatible LCD screen to show its status (input and output voltages, output current and output power).
