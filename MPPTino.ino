@@ -83,8 +83,8 @@ MCP4716 dac(dacVarient);
 constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
 uint16_t dacValue = 0;
 
-constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 50 / 11; }
-constexpr uint16_t voutTransform_dV(uint16_t count) { return count * 39 / 38; }
+constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 13 + 472) / 40; }
+constexpr uint16_t voutTransform_dV(uint16_t count) { return (count * 11 + 26) / 12; }
 constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? count * 8 / 5 + 5 : 0; }
 
 void SetMPPVoltage(uint16_t mppv_dv) {
