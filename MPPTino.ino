@@ -67,16 +67,7 @@ void updateAverage() {
   averagePower.pout_dw = (uint16_t)(summedPower.pout_dw / maxSamples);
   memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
   numSamples = 0;
-}
-void updateAverageFromSleep() {
-  validAverage = power.vin_cv > 1000; // LMR16006 buck converter is not reliable under 10V
-  if(validAverage) {
-    averagePower.vin_cv = power.vin_cv;
-    averagePower.vout_dv = power.vout_dv;
-    // We were just sleeping, thus set amps and power to 0 for that period
-    averagePower.iout_ca = 0;
-    averagePower.pout_dw = 0;
-  }
+  validAverage = true;
 }
 
 MCP4716 dac(dacVarient);
@@ -84,7 +75,7 @@ constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; 
 uint16_t dacValue = 0;
 
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 13 + 472) / 40; }
-constexpr uint16_t voutTransform_dV(uint16_t count) { return (count * 11 + 26) / 12; }
+constexpr uint16_t voutTransform_dV(uint16_t count) { return count - (count * 5 + 35) / 69; }
 constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? count * 8 / 5 + 5 : 0; }
 
 void SetMPPVoltage(uint16_t mppv_dv) {
@@ -122,6 +113,7 @@ void goToSleep() {
   disableADC();
 
   sleeping = true;
+  wdt_reset();
   wdtWakeups = 0;
 }
 
@@ -131,19 +123,20 @@ void resumeSleep() {
   SMCR = 0;
 }
 
-void wakeup() {
+bool try_wakeup() {
+  enableADC();
   if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
     PORTD |= _BV(PORTD3);
     PORTB |= _BV(PORTB5);
 
     delay(wakeupCheckDuration);
-    if(analogRead(PIN_IOUT) > 0) {
-      sleeping = false;
-    } else {
-      PORTD &= ~_BV(PORTD3);
-      PORTB &= ~_BV(PORTB5);
-    }
+    if(analogRead(PIN_IOUT) > 0) return true;
+
+    PORTD &= ~_BV(PORTD3);
+    PORTB &= ~_BV(PORTB5);
   }
+  disableADC();
+  return false;
 }
 
 void readSensors() {
@@ -199,7 +192,15 @@ void runCommand(CommandID command) {
     SendRS485(&MAGIC_NUMBER, sizeof(MAGIC_NUMBER), false);
     break;
   case READ_ALL:
-    if(validAverage) SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
+    if(validAverage) {
+      SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
+      validAverage = false;
+    } else {
+      enableADC();
+      readSensors();
+      disableADC();
+      if(power.vin_cv > 1000) SendRS485((uint8_t*)(&power), sizeof(power))
+    }
     break;
   case SET_MPP_MANUAL_DV:
     Serial.readBytes((uint8_t*)&manualMPP_dv, sizeof(manualMPP_dv));
@@ -229,7 +230,11 @@ void updateState() {
   summedPower = summedPower + power;
   numSamples++;
 
-  if(noCurrentBefore && power.iout_ca == 0) goToSleep();
+  if(noCurrentBefore && power.iout_ca == 0) {
+    goToSleep();
+    lastPower_dw = 0;
+    return;
+  }
 
   if(!manualMPP_dv) {
     if(power.pout_dw > minPowerMPPT_dw) {
@@ -259,6 +264,7 @@ uint8_t updateSerialState(uint8_t byte) {
     case MAGIC2: return byte == cmd_magic[1] ? IDENTITY : MAGIC1;
     case IDENTITY: return byte == EEPROM.read(0) ? COMMAND : MAGIC1;
     case COMMAND: runCommand((CommandID)byte); return MAGIC1;
+    default: return MAGIC1;
   }
 }
 
@@ -273,16 +279,14 @@ void loop() {
     }
   } else {
     resumeSleep();
-    if(wdtWakeups >= wakeupCheckWDTP) {
+    if(!forceDisableOutput && wdtWakeups >= wakeupCheckWDTP) {
+      wdtWakeups = 0;
+#if USE_LCD
       enableADC();
       readSensors();
-#if USE_LCD
       updateLCD();
 #endif
-      updateAverageFromSleep();
-      if(!forceDisableOutput) wakeup();
-      if(sleeping) disableADC();
-      wdtWakeups = 0;
+      sleeping = !try_wakeup();
     }
   }
 
