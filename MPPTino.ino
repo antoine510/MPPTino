@@ -59,15 +59,18 @@ constexpr uint8_t maxSamples = stateAveragingPeriod / stateUpdatePeriod;
 
 PowerPoint averagePower;
 bool validAverage = false;
-void updateAverage() {
+void resetAveragingAccumulator() {
+  memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
+  numSamples = 0;
+}
+void updateAverage(uint8_t periodSamples = maxSamples) {
   averagePower.vin_cv = (uint16_t)(summedPower.vin_cv / numSamples);
   averagePower.vout_dv = (uint16_t)(summedPower.vout_dv / numSamples);
   // Current and power are 0 for all samples between numSamples and maxSamples
-  averagePower.iout_ca = (uint16_t)(summedPower.iout_ca / maxSamples);
-  averagePower.pout_dw = (uint16_t)(summedPower.pout_dw / maxSamples);
-  memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
-  numSamples = 0;
+  averagePower.iout_ca = (uint16_t)(summedPower.iout_ca / periodSamples);
+  averagePower.pout_dw = (uint16_t)(summedPower.pout_dw / periodSamples);
   validAverage = true;
+  resetAveragingAccumulator();
 }
 
 MCP4716 dac(dacVarient);
@@ -193,13 +196,17 @@ void runCommand(CommandID command) {
     break;
   case READ_ALL:
     if(validAverage) {
+      if(numSamples < 3) resetAveragingAccumulator(); // Re-sync by reseting the averaging accumulator
+      else if(numSamples >= maxSamples - 3) updateAverage(numSamples); // Re-sync by triggering averaging a bit early, do not deduct power when averaging smaller sample count
       SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
-      validAverage = false;
-    } else {
+    } else if(sleeping) {
       enableADC();
       readSensors();
       disableADC();
-      if(power.vin_cv > 1000) SendRS485((uint8_t*)(&power), sizeof(power))
+      if(power.vin_cv > 1000) SendRS485((uint8_t*)(&power), sizeof(power));
+    } else if(numSamples) {
+      updateAverage(); // Update average with all data samples until now
+      SendRS485((uint8_t*)(&averagePower), sizeof(averagePower));
     }
     break;
   case SET_MPP_MANUAL_DV:
@@ -273,20 +280,24 @@ void loop() {
   if(!sleeping) {
     const unsigned long now = millis();
     if(now >= nextStateUpdate) {  // Safe to compare absolute times because we reboot at least every night
-      nextStateUpdate = now + stateUpdatePeriod;
+      nextStateUpdate += stateUpdatePeriod;
       updateState();
       if(numSamples == maxSamples) updateAverage();
     }
   } else {
-    resumeSleep();
+    resumeSleep();  // We return from this function on WDT or Serial interrupt
     if(!forceDisableOutput && wdtWakeups >= wakeupCheckWDTP) {
       wdtWakeups = 0;
+      validAverage = false;
 #if USE_LCD
       enableADC();
       readSensors();
       updateLCD();
 #endif
-      sleeping = !try_wakeup();
+      if(try_wakeup()) {
+        sleeping = false;
+        nextStateUpdate = millis();
+      }
     }
   }
 
