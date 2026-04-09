@@ -1,5 +1,7 @@
 #include <EEPROM.h>
+#include <Wire.h>
 #include <MCP4716.h>
+#include <MCP4725.h>
 #include <avr/wdt.h>
 
 #define USE_LCD 0
@@ -10,12 +12,15 @@
 constexpr uint16_t maxMPPVoltage_dv = 350;
 constexpr uint16_t minMPPVoltage_dv = 280;
 constexpr uint16_t minPowerMPPT_dw = 50;
-constexpr uint16_t wakeupVoltage_cv = 3300;
-constexpr uint16_t dacStep = 8;
-constexpr uint8_t dacVarient = 0;
+constexpr uint16_t vinDACStep = 8;
+constexpr uint8_t vinDACVarient = 0;
+constexpr uint8_t voutDACVarient = 0;
+
+constexpr uint16_t wakeupVoltage_cv = 3200;
+constexpr uint16_t shutdownVoltage_cv = 2500;
+
 constexpr unsigned long stateUpdatePeriod = 500;
 constexpr unsigned long stateAveragingPeriod = 60000;
-constexpr unsigned long wakeupCheckDuration = 500;
 constexpr unsigned long wakeupCheckWDTP = 6;  // wakeup check period in multiples of WDR period (9.8s @-8°C to 10s @32°C)
 
 enum Pins {
@@ -33,7 +38,8 @@ enum CommandID : uint8_t {
   SET_MPP_MANUAL_DV = 0x2,
   SET_MPP_AUTO = 0x3,
   ENABLE_OUTPUT = 0x4,
-  DISABLE_OUTPUT = 0x5
+  DISABLE_OUTPUT = 0x5,
+  SET_VOUT_TUNE = 0x6
 };
 
 struct PowerPoint {
@@ -60,7 +66,7 @@ constexpr uint8_t maxSamples = stateAveragingPeriod / stateUpdatePeriod;
 PowerPoint averagePower;
 bool validAverage = false;
 void resetAveragingAccumulator() {
-  memset((uint8_t*)(&summedPower), 0, sizeof(summedPower));
+  memset(&summedPower, 0, sizeof(summedPower));
   numSamples = 0;
 }
 void updateAverage(uint8_t periodSamples = maxSamples) {
@@ -73,33 +79,38 @@ void updateAverage(uint8_t periodSamples = maxSamples) {
   resetAveragingAccumulator();
 }
 
-MCP4716 dac(dacVarient);
-constexpr uint16_t VoltageToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
-uint16_t dacValue = 0;
-
 constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 13 + 472) / 40; }
 constexpr uint16_t voutTransform_dV(uint16_t count) { return count - (count * 5 + 35) / 69; }
 constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? count * 8 / 5 + 5 : 0; }
 
+MCP4716 vinDAC(vinDACVarient);
+constexpr uint16_t VinToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
+uint16_t vinDACValue = 0;
+
 void SetMPPVoltage(uint16_t mppv_dv) {
-  auto newDACValue = VoltageToDAC(mppv_dv);
-  if(newDACValue == dacValue) return;
-  dacValue = newDACValue;
-  dac.SetValue(dacValue);
+  auto newDACValue = VinToDAC(mppv_dv);
+  if(newDACValue == vinDACValue) return;
+  vinDACValue = newDACValue;
+  vinDAC.SetValue(vinDACValue);
 }
 
 bool NudgeMPP(bool increase) {
-  static constexpr uint16_t dacMin = VoltageToDAC(minMPPVoltage_dv), dacMax = VoltageToDAC(maxMPPVoltage_dv);
+  static constexpr uint16_t dacMin = VinToDAC(minMPPVoltage_dv), dacMax = VinToDAC(maxMPPVoltage_dv);
   bool saturation = false;
   if(increase) {
-    if(dacValue < dacMax - dacStep) dacValue += dacStep;
-    else { dacValue = dacMax; saturation = true; }
+    if(vinDACValue < dacMax - vinDACStep) vinDACValue += vinDACStep;
+    else { vinDACValue = dacMax; saturation = true; }
   } else {
-    if(dacValue > dacMin + dacStep) dacValue -= dacStep;
-    else { dacValue = dacMin; saturation = true; }
+    if(vinDACValue > dacMin + vinDACStep) vinDACValue -= vinDACStep;
+    else { vinDACValue = dacMin; saturation = true; }
   }
-  dac.SetValue(dacValue);
+  vinDAC.SetValue(vinDACValue);
   return saturation;
+}
+
+MCP4725 voutDAC{voutDACVarient, true};
+void SetVoutDAC(uint16_t value) {
+  voutDAC.Write(value);
 }
 
 void SendRS485(const uint8_t* data, size_t len, bool withCRC = true);
@@ -126,22 +137,6 @@ void resumeSleep() {
   SMCR = 0;
 }
 
-bool try_wakeup() {
-  enableADC();
-  if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
-    PORTD |= _BV(PORTD3);
-    PORTB |= _BV(PORTB5);
-
-    delay(wakeupCheckDuration);
-    if(analogRead(PIN_IOUT) > 0) return true;
-
-    PORTD &= ~_BV(PORTD3);
-    PORTB &= ~_BV(PORTB5);
-  }
-  disableADC();
-  return false;
-}
-
 void readSensors() {
   power.vin_cv = vinTransform_cV(analogRead(PIN_VIN));
   power.vout_dv = voutTransform_dV(analogRead(PIN_VOUT));
@@ -160,6 +155,7 @@ extern "C" void __attribute__((naked, used, section (".init3"))) init3() {
 
 void setup() {
   Serial.begin(9600);
+  Wire.begin();
 
   // Enable wakeup on serial byte complete, RXCIE is set by Serial.begin
   UCSR0D = _BV(SFDE);
@@ -186,6 +182,18 @@ void SendRS485(const uint8_t* data, size_t len, bool withCRC) {
   PORTD &= ~_BV(PORTD2);
 }
 
+template<typename T>
+bool SerialReadChecked(T* target) {
+  uint8_t serialBytes[sizeof(T) + 1];
+  Serial.readBytes(serialBytes, sizeof(T) + 1);
+  if(serialBytes[sizeof(T)] == crc(serialBytes, sizeof(T))) {
+    memcpy(target, serialBytes, sizeof(T));
+    return true;
+  } else {
+    return false;
+  }
+}
+
 uint16_t manualMPP_dv = 0; // 0 for automatic
 bool forceDisableOutput = false;
 void runCommand(CommandID command) {
@@ -210,8 +218,7 @@ void runCommand(CommandID command) {
     }
     break;
   case SET_MPP_MANUAL_DV:
-    Serial.readBytes((uint8_t*)&manualMPP_dv, sizeof(manualMPP_dv));
-    SetMPPVoltage(manualMPP_dv);
+    if(SerialReadChecked(&manualMPP_dv)) SetMPPVoltage(manualMPP_dv);
     break;
   case SET_MPP_AUTO:
     manualMPP_dv = 0;
@@ -223,6 +230,9 @@ void runCommand(CommandID command) {
     forceDisableOutput = true;
     if(!sleeping) goToSleep();
     break;
+  case SET_VOUT_TUNE:
+    if(uint16_t dacValue; SerialReadChecked(&dacValue)) SetVoutDAC(dacValue);
+    break;
   }
 }
 
@@ -230,20 +240,14 @@ void updateState() {
   static bool increaseMPPV = true;
   static uint16_t lastPower_dw = 0;
 
-  const bool noCurrentBefore = power.iout_ca == 0;
-
   readSensors();
 
   summedPower = summedPower + power;
   numSamples++;
 
-  if(noCurrentBefore && power.iout_ca == 0) {
+  if(power.vin_cv < shutdownVoltage_cv) {
     goToSleep();
-    lastPower_dw = 0;
-    return;
-  }
-
-  if(!manualMPP_dv) {
+  } else if(!manualMPP_dv) {
     if(power.pout_dw > minPowerMPPT_dw) {
       if(power.pout_dw < lastPower_dw) increaseMPPV = !increaseMPPV;
       if(NudgeMPP(increaseMPPV)) increaseMPPV = !increaseMPPV;
@@ -289,14 +293,18 @@ void loop() {
     if(!forceDisableOutput && wdtWakeups >= wakeupCheckWDTP) {
       wdtWakeups = 0;
       validAverage = false;
-#if USE_LCD
       enableADC();
+#if USE_LCD
       readSensors();
       updateLCD();
 #endif
-      if(try_wakeup()) {
+      if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
+        PORTD |= _BV(PORTD3); // Enable LTC3813
+        PORTB |= _BV(PORTB5); // Enable LED
         sleeping = false;
         nextStateUpdate = millis();
+      } else {
+        disableADC();
       }
     }
   }
