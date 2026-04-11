@@ -79,9 +79,10 @@ void updateAverage(uint8_t periodSamples = maxSamples) {
   resetAveragingAccumulator();
 }
 
-constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 13 + 472) / 40; }
-constexpr uint16_t voutTransform_dV(uint16_t count) { return count - (count * 5 + 35) / 69; }
-constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? count * 8 / 5 + 5 : 0; }
+// Calibrations for MPPT v2.10 #1
+constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 21 + 476) / 52; }
+constexpr uint16_t voutTransform_dV(uint16_t count) { return (count * 12 + 31) / 13; }
+constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? (count * 29 + 74) / 18 : 0; }
 
 MCP4716 vinDAC(vinDACVarient);
 constexpr uint16_t VinToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }

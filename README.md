@@ -5,8 +5,8 @@ To do so, it interfaces with a LTC3813 boost controller, a INA180 current sense 
 There are a few states that can be used by the MPPT depending on conditions:
 - At startup the solar panels have a high impedance, it is important to limit the power consumption as much as possible. The controller enters sleep mode.
 - Sleep mode. The ATmega328PB is in power-down mode and wakes-up periodically to check the panel voltage against the minimum start-up voltage.
-  If the voltage is OK, it then tries to start the LTC3813 boost controller and waits for positive power at the output.
-  If power is produced, the MPPT enters active mode; otherwise sleep is resumed.
+  If the voltage is OK, it then tries to start the LTC3813 boost controller.
+  If the voltage does not drop below the minimum running voltage (25 V), the MPPT enters active mode; otherwise sleep is resumed.
 - Low power mode. When the power produced is below 5 watts, the tracking algorithm is disabled, the MPPT maintains a constant 28 volts.
 - Tracking mode. When the power is sufficient, the tracking algorithm is enabled and tries to maintain maximum power in the range from 28 to 35 volts.
 
@@ -24,6 +24,7 @@ The two start bytes identify this protocol, `BOARD_ID` selects the MPPT to commu
 - `SET_MPP_AUTO`: Reset to automatic power point tracking.
 - `ENABLE_OUTPUT`: Enables power production.
 - `DISABLE_OUTPUT`: Disables power production.
+- `SET_VOUT_TUNE`: Sets the output voltage tune in about 2 mV steps. Range is [0, 4095]. Default is 2048.
 
 The PowerPoint returned by `READ_ALL` is structured as follows:
 ```cpp
@@ -50,8 +51,45 @@ void setup() {
 void loop() {}
 ```
 
+## Calibrating
+
+Scan through voltages and currents to have data points around the operating region.
+Use the following calibration code. Switch from PIN_VIN to PIN_VOUT and PIN_IOUT to calibrate each parameter.
+
+```cpp
+enum Pins {
+  PIN_VIN = A1,
+  PIN_VOUT = A2,
+  PIN_IOUT = A3
+};
+
+void SendRS485(const uint8_t* data, size_t len) {
+  PORTD |= _BV(PORTD2);
+  Serial.write(data, len);
+  Serial.flush();
+  PORTD &= ~_BV(PORTD2);
+}
+
+extern "C" void __attribute__((naked, used, section (".init3"))) init3() {
+  DDRB = _BV(DDRB5);
+  DDRD = _BV(DDRD2) | _BV(DDRD3);
+}
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  uint8_t str[16];
+  SendRS485(str, sprintf((char*)str, "%d\r\n", analogRead(PIN_VIN)));
+  delay(1000);
+}
+```
+
 ## Setting up the fuses
 
+Use the following command to read the fuses: `./bin/avrdude.exe -C etc/avrdude.conf -c usbasp -p m328pb -B 125kHz -U efuse:r:-:h -U hfuse:r:-:h -U lfuse:r:-:h`
+Use the following command to set the fuses: `./bin/avrdude.exe -C etc/avrdude.conf -c usbasp -p m328pb -B 125kHz -U efuse:w:0xf4:m -U hfuse:w:0xd7:m -U lfuse:w:0xc2:m`
 The correct fuse configuration is as follows:
 - efuse is set to `0xf4`. This enables the BOD at 4.3 V.
 - hfuse is set to `0xd7`. This preserves the EEPROM contents and disables the bootloader.
