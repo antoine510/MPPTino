@@ -79,8 +79,12 @@ void setup() {
   Serial.begin(9600);
 }
 
+constexpr bool enableBoost = false;
+
 void loop() {
-  uint8_t str[16];
+  static uint8_t str[16];
+  int vin = analogRead(PIN_VIN);
+  if(enableBoost && vin > 500) PORTD |= _BV(PORTD3); else if(vin < 470) PORTD &= ~_BV(PORTD3);
   SendRS485(str, sprintf((char*)str, "%d\r\n", analogRead(PIN_VIN)));
   delay(1000);
 }

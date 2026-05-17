@@ -16,7 +16,7 @@ constexpr uint16_t vinDACStep = 8;
 constexpr uint8_t vinDACVarient = 0;
 constexpr uint8_t voutDACVarient = 0;
 
-constexpr uint16_t wakeupVoltage_cv = 3200;
+constexpr uint16_t wakeupVoltage_cv = 3400;
 constexpr uint16_t shutdownVoltage_cv = 2500;
 
 constexpr unsigned long stateUpdatePeriod = 500;
@@ -79,10 +79,10 @@ void updateAverage(uint8_t periodSamples = maxSamples) {
   resetAveragingAccumulator();
 }
 
-// Calibrations for MPPT v2.10 #1
-constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 21 + 476) / 52; }
-constexpr uint16_t voutTransform_dV(uint16_t count) { return (count * 12 + 31) / 13; }
-constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? (count * 29 + 74) / 18 : 0; }
+// Calibrations for MPPT v2.10 #2
+constexpr uint16_t vinTransform_cV(uint16_t count) { return count * 5 + (count * 17 + 738) / 48; }
+constexpr uint16_t voutTransform_dV(uint16_t count) { return (count * 13 + 0) / 14; }
+constexpr uint16_t ioutTransform_cA(uint16_t count) { return count ? (count * 37 + 85) / 23 : 0; }
 
 MCP4716 vinDAC(vinDACVarient);
 constexpr uint16_t VinToDAC(uint16_t mppv_dv) { return (mppv_dv - 261) * 9; }
@@ -123,13 +123,23 @@ volatile uint8_t wdtWakeups = 0;  // About 10s each
 void goToSleep() {
   if(numSamples) updateAverage(); // Update average with all data samples until now
   SetMPPVoltage(minMPPVoltage_dv);
-  PORTD &= ~_BV(PORTD3);
-  PORTB &= ~_BV(PORTB5);
+  PORTD &= ~_BV(PORTD3);  // Disable LTC3813
+  PORTB &= ~_BV(PORTB5);  // Disable LED
   disableADC();
 
   sleeping = true;
   wdt_reset();
   wdtWakeups = 0;
+}
+
+bool tryWakeup() {
+  if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
+    PORTD |= _BV(PORTD3); // Enable LTC3813
+    PORTB |= _BV(PORTB5); // Enable LED
+    sleeping = false;
+    return true;
+  }
+  return false;
 }
 
 void resumeSleep() {
@@ -283,8 +293,7 @@ uint8_t updateSerialState(uint8_t byte) {
 void loop() {
   static unsigned long nextStateUpdate = 0;
   if(!sleeping) {
-    const unsigned long now = millis();
-    if(now >= nextStateUpdate) {  // Safe to compare absolute times because we reboot at least every night
+    if(millis() >= nextStateUpdate) {  // Safe to compare absolute times because we reboot at least every night
       nextStateUpdate += stateUpdatePeriod;
       updateState();
       if(numSamples == maxSamples) updateAverage();
@@ -299,14 +308,7 @@ void loop() {
       readSensors();
       updateLCD();
 #endif
-      if(vinTransform_cV(analogRead(PIN_VIN)) > wakeupVoltage_cv) {
-        PORTD |= _BV(PORTD3); // Enable LTC3813
-        PORTB |= _BV(PORTB5); // Enable LED
-        sleeping = false;
-        nextStateUpdate = millis();
-      } else {
-        disableADC();
-      }
+      if(tryWakeup()) nextStateUpdate = millis(); else disableADC();
     }
   }
 
